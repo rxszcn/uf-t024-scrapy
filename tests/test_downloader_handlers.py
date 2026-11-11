@@ -1,0 +1,652 @@
+"""Tests for DownloadHandlers and for specific non-HTTP download handlers."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+from pathlib import Path
+from tempfile import mkdtemp, mkstemp
+from unittest import mock
+
+import pytest
+from twisted.internet.defer import CancelledError
+from twisted.internet.error import ConnectionRefusedError as TxConnectionRefusedError
+from twisted.internet.error import DNSLookupError
+from twisted.internet.error import TimeoutError as TxTimeoutError
+from twisted.web.client import ResponseFailed
+from twisted.web.error import SchemeNotSupported
+from w3lib.url import path_to_file_uri
+
+from scrapy.core.downloader.handlers import DownloadHandlers
+from scrapy.core.downloader.handlers.datauri import DataURIDownloadHandler
+from scrapy.core.downloader.handlers.file import FileDownloadHandler
+from scrapy.core.downloader.handlers.s3 import S3DownloadHandler
+from scrapy.exceptions import (
+    CannotResolveHostError,
+    DownloadCancelledError,
+    DownloadConnectionRefusedError,
+    DownloadFailedError,
+    DownloadTimeoutError,
+    NotConfigured,
+    NotSupported,
+    ScrapyDeprecationWarning,
+    StopDownload,
+    UnsupportedURLSchemeError,
+)
+from scrapy.http import BodyFileResponse, Request, Response, TextResponse
+from scrapy.responsetypes import responsetypes
+from scrapy.utils._download_handlers import wrap_twisted_exceptions
+from scrapy.utils.boto import is_botocore_available
+from scrapy.utils.misc import build_from_crawler
+from scrapy.utils.test import get_crawler
+from tests.utils.decorators import coroutine_test
+
+
+class DummyDH:
+    lazy = False
+
+    async def download_request(self, request):
+        pass
+
+
+class NamedDH:
+    lazy = False
+
+    async def download_request(self, request):
+        return Response(request.url, body=b"named")
+
+
+class SchemeDH:
+    lazy = False
+
+    async def download_request(self, request):
+        return Response(request.url, body=b"scheme")
+
+
+class BodyFileDH:
+    lazy = False
+
+    async def download_request(self, request):
+        Path(request.meta["body_file"]).write_bytes(b"body")
+        if request.url.endswith("/fail"):
+            raise DownloadFailedError
+        if request.url.endswith("/stop"):
+            raise StopDownload(fail=True)
+        return BodyFileResponse(request.url, body_file=request.meta["body_file"])
+
+
+class DummyLazyDH:
+    # Default (but deprecated) is lazy for backward compatibility
+    async def download_request(self, request):
+        pass
+
+
+class OffDH:
+    lazy = False
+
+    def __init__(self, crawler):
+        raise NotConfigured
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler)
+
+
+class BuggyDH:
+    lazy = False
+
+    def __init__(self, crawler):
+        raise ValueError
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler)
+
+
+class TestLoad:
+    def test_enabled_handler(self):
+        handlers = {"scheme": DummyDH}
+        crawler = get_crawler(settings_dict={"DOWNLOAD_HANDLERS": handlers})
+        dh = DownloadHandlers(crawler)
+        assert "scheme" in dh._schemes
+        assert "scheme" in dh._handlers
+        assert "scheme" not in dh._notconfigured
+
+    def test_not_configured_handler(self):
+        handlers = {"scheme": OffDH}
+        crawler = get_crawler(settings_dict={"DOWNLOAD_HANDLERS": handlers})
+        dh = DownloadHandlers(crawler)
+        assert "scheme" in dh._schemes
+        assert "scheme" not in dh._handlers
+        assert "scheme" in dh._notconfigured
+
+    def test_buggy_handler(self, caplog: pytest.LogCaptureFixture) -> None:
+        handlers = {"scheme": BuggyDH}
+        crawler = get_crawler(settings_dict={"DOWNLOAD_HANDLERS": handlers})
+        dh = DownloadHandlers(crawler)
+        assert "scheme" in dh._schemes
+        assert "scheme" not in dh._handlers
+        assert "scheme" in dh._notconfigured
+        assert (
+            'Loading "<class \'tests.test_downloader_handlers.BuggyDH\'>" for handler ID "scheme"'
+            in caplog.text
+        )
+
+    def test_disabled_handler(self):
+        handlers = {"scheme": None}
+        crawler = get_crawler(settings_dict={"DOWNLOAD_HANDLERS": handlers})
+        dh = DownloadHandlers(crawler)
+        assert "scheme" not in dh._schemes
+        assert dh._get_handler("scheme") is None
+        assert "scheme" not in dh._handlers
+        assert "scheme" in dh._notconfigured
+        # get the handler again to cover the code that gets it from dh._notconfigured
+        assert dh._get_handler("scheme") is None
+
+    def test_lazy_handlers(self):
+        handlers = {"scheme": DummyLazyDH}
+        crawler = get_crawler(settings_dict={"DOWNLOAD_HANDLERS": handlers})
+        with pytest.warns(
+            ScrapyDeprecationWarning,
+            match="DummyLazyDH doesn't define a 'lazy' attribute",
+        ):
+            dh = DownloadHandlers(crawler)
+        assert "scheme" in dh._schemes
+        assert "scheme" not in dh._handlers
+        handler = dh._get_handler("scheme")  # force load lazy handler
+        assert handler
+        assert "scheme" in dh._handlers
+        assert "scheme" not in dh._notconfigured
+
+
+class AwaitRequestDH:
+    lazy = False
+
+    async def download_request(self, request):
+        return await Request(request.url)
+
+
+class TestDownloadHandlerAwaitProhibited:
+    @coroutine_test
+    async def test_await_request_prohibited(self) -> None:
+        crawler = get_crawler(
+            settings_dict={"DOWNLOAD_HANDLERS": {"scheme": AwaitRequestDH}}
+        )
+        crawler.spider = crawler._create_spider()
+        dh = DownloadHandlers(crawler)
+        request = Request("scheme://example.com")
+        with pytest.raises(RuntimeError, match="download handler"):
+            await dh.download_request_async(request)
+
+
+class TestHandlerID:
+    @staticmethod
+    def _get_dh() -> DownloadHandlers:
+        crawler = get_crawler(
+            settings_dict={
+                "DOWNLOAD_HANDLERS": {"https": SchemeDH},
+                "DOWNLOAD_HANDLERS_BY_NAME": {"named": NamedDH},
+            }
+        )
+        crawler.spider = crawler._create_spider()
+        return DownloadHandlers(crawler)
+
+    def test_clashing_ids(self) -> None:
+        crawler = get_crawler(
+            settings_dict={
+                "DOWNLOAD_HANDLERS": {"https": SchemeDH},
+                "DOWNLOAD_HANDLERS_BY_NAME": {"https": NamedDH},
+            }
+        )
+        with pytest.raises(ValueError, match="defined both in DOWNLOAD_HANDLERS"):
+            DownloadHandlers(crawler)
+
+    @coroutine_test
+    async def test_name_not_a_scheme(self) -> None:
+        dh = self._get_dh()
+        with pytest.raises(NotSupported, match="Unsupported URL scheme 'named'"):
+            await dh.download_request_async(Request("named://example.com"))
+
+    @coroutine_test
+    async def test_name_in_meta(self) -> None:
+        dh = self._get_dh()
+        request = Request("https://example.com", meta={"download_handler": "named"})
+        response = await dh.download_request_async(request)
+        assert response.body == b"named"
+
+    @coroutine_test
+    async def test_scheme_in_meta(self) -> None:
+        dh = self._get_dh()
+        request = Request("ftp://example.com", meta={"download_handler": "https"})
+        response = await dh.download_request_async(request)
+        assert response.body == b"scheme"
+
+    @coroutine_test
+    async def test_unknown_id_in_meta(self) -> None:
+        dh = self._get_dh()
+        request = Request("https://example.com", meta={"download_handler": "nmaed"})
+        with pytest.raises(
+            NotSupported, match="Unusable download handler 'nmaed': no handler with"
+        ):
+            await dh.download_request_async(request)
+
+
+class TestBodyFile:
+    @staticmethod
+    def _get_dh() -> DownloadHandlers:
+        crawler = get_crawler(
+            settings_dict={
+                "DOWNLOAD_HANDLERS": {"https": BodyFileDH},
+                "DOWNLOAD_HANDLERS_BY_NAME": {"named": NamedDH},
+            }
+        )
+        crawler.spider = crawler._create_spider()
+        return DownloadHandlers(crawler)
+
+    @coroutine_test
+    async def test_path(self, tmp_path: Path) -> None:
+        body_file = tmp_path / "body"
+        request = Request("https://example.com", meta={"body_file": body_file})
+        response = await self._get_dh().download_request_async(request)
+        assert isinstance(response, BodyFileResponse)
+        assert response.body_file == body_file
+        assert body_file.read_bytes() == b"body"
+
+    @coroutine_test
+    async def test_temporary(self) -> None:
+        request = Request("https://example.com", meta={"body_file": True})
+        response = await self._get_dh().download_request_async(request)
+        assert isinstance(response, BodyFileResponse)
+        body_file = Path(response.body_file)
+        assert request.meta["body_file"] == response.body_file
+        assert body_file.read_bytes() == b"body"
+        body_file.unlink()
+
+    @pytest.mark.parametrize(
+        ("url", "meta", "exception"),
+        [
+            ("https://example.com/fail", {}, DownloadFailedError),
+            ("https://example.com", {"download_handler": "named"}, NotSupported),
+        ],
+    )
+    @coroutine_test
+    async def test_temporary_failure(
+        self, url: str, meta: dict[str, str], exception: type[Exception]
+    ) -> None:
+        request = Request(url, meta={**meta, "body_file": True})
+        created: list[str] = []
+        real_mkstemp = mkstemp
+
+        def mock_mkstemp() -> tuple[int, str]:
+            fd, path = real_mkstemp()
+            created.append(path)
+            return fd, path
+
+        with (
+            mock.patch("scrapy.core.downloader.handlers.mkstemp", mock_mkstemp),
+            pytest.raises(exception),
+        ):
+            await self._get_dh().download_request_async(request)
+        assert request.meta["body_file"] is True
+        assert len(created) == 1
+        assert not Path(created[0]).exists()
+
+    @coroutine_test
+    async def test_temporary_stop_download(self) -> None:
+        request = Request("https://example.com/stop", meta={"body_file": True})
+        with pytest.raises(StopDownload):
+            await self._get_dh().download_request_async(request)
+        body_file = Path(request.meta["body_file"])
+        assert body_file.read_bytes() == b"body"
+        body_file.unlink()
+
+    @coroutine_test
+    async def test_unsupported(self, tmp_path: Path) -> None:
+        body_file = tmp_path / "body"
+        request = Request(
+            "https://example.com",
+            meta={"body_file": body_file, "download_handler": "named"},
+        )
+        with pytest.raises(
+            NotSupported,
+            match="NamedDH does not support the body_file request meta key",
+        ):
+            await self._get_dh().download_request_async(request)
+        assert not body_file.exists()
+
+
+class TestFile:
+    def setup_method(self):
+        # add a special char to check that they are handled correctly
+        self.fd, self.tmpname = mkstemp(suffix="^")
+        Path(self.tmpname).write_text("0123456789", encoding="utf-8")
+        download_handler = build_from_crawler(FileDownloadHandler, get_crawler())
+        self.download_request = download_handler.download_request
+
+    def teardown_method(self):
+        os.close(self.fd)
+        Path(self.tmpname).unlink()
+
+    @coroutine_test
+    async def test_download(self):
+        request = Request(path_to_file_uri(self.tmpname))
+        assert request.url.upper().endswith("%5E")
+        response = await self.download_request(request)
+        assert response.url == request.url
+        assert response.status == 200
+        assert response.body == b"0123456789"
+        assert response.protocol is None
+
+    @coroutine_test
+    async def test_non_existent(self):
+        request = Request(path_to_file_uri(mkdtemp()))
+        # the specific exception differs between platforms
+        with pytest.raises(OSError):  # noqa: PT011
+            await self.download_request(request)
+
+
+class HttpDownloadHandlerMock:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def download_request(self, request):
+        return request
+
+
+@pytest.mark.requires_botocore
+class TestS3Anon:
+    def setup_method(self):
+        crawler = get_crawler(
+            settings_dict={
+                "DOWNLOAD_HANDLERS": {"https": HttpDownloadHandlerMock},
+            }
+        )
+        self.s3reqh = build_from_crawler(S3DownloadHandler, crawler)
+        self.download_request = self.s3reqh.download_request
+
+    @coroutine_test
+    async def test_anon_request(self):
+        req = Request("s3://aws-publicdatasets/")
+        httpreq = await self.download_request(req)
+        assert hasattr(self.s3reqh, "anon")
+        assert self.s3reqh.anon
+        assert httpreq.url == "https://aws-publicdatasets.s3.amazonaws.com/"
+
+    @coroutine_test
+    async def test_anon_request_insecure(self):
+        req = Request("s3://aws-publicdatasets/", meta={"is_secure": False})
+        with pytest.warns(
+            ScrapyDeprecationWarning,
+            match="Passing is_secure=False for s3:// requests is deprecated",
+        ):
+            httpreq = await self.download_request(req)
+        assert httpreq.url == "http://aws-publicdatasets.s3.amazonaws.com/"
+
+
+@pytest.mark.requires_botocore
+class TestS3:
+    def setup_method(self):
+        # test use same example keys than amazon developer guide
+        # http://s3.amazonaws.com/awsdocs/S3/20060301/s3-dg-20060301.pdf
+        # and the tests described here are the examples from that manual
+        crawler = get_crawler(
+            settings_dict={
+                "AWS_ACCESS_KEY_ID": "0PN5J17HBGZHT7JJ3X82",
+                "AWS_SECRET_ACCESS_KEY": "uV3F3YluFJax1cknvbcGwgjvx4QpvB+leU8dUj2o",
+                "DOWNLOAD_HANDLERS": {"https": HttpDownloadHandlerMock},
+            }
+        )
+        s3reqh = build_from_crawler(S3DownloadHandler, crawler)
+        self.download_request = s3reqh.download_request
+
+    @contextlib.contextmanager
+    def _mocked_date(self, date):
+        import botocore.auth  # noqa: F401,PLC0415
+
+        # We need to mock botocore.auth.formatdate, because otherwise
+        # botocore overrides Date header with current date and time
+        # and Authorization header is different each time
+        with mock.patch("botocore.auth.formatdate") as mock_formatdate:
+            mock_formatdate.return_value = date
+            yield
+
+    @coroutine_test
+    async def test_secure_by_default(self):
+        req = Request("s3://johnsmith/photos/puppy.jpg")
+        httpreq = await self.download_request(req)
+        assert httpreq.url == "https://johnsmith.s3.amazonaws.com/photos/puppy.jpg"
+
+    @coroutine_test
+    async def test_insecure_opt_out(self):
+        req = Request("s3://johnsmith/photos/puppy.jpg", meta={"is_secure": False})
+        with pytest.warns(
+            ScrapyDeprecationWarning,
+            match="Passing is_secure=False for s3:// requests is deprecated",
+        ):
+            httpreq = await self.download_request(req)
+        assert httpreq.url == "http://johnsmith.s3.amazonaws.com/photos/puppy.jpg"
+
+    @coroutine_test
+    async def test_request_signing1(self):
+        # gets an object from the johnsmith bucket.
+        date = "Tue, 27 Mar 2007 19:36:42 +0000"
+        req = Request("s3://johnsmith/photos/puppy.jpg", headers={"Date": date})
+        with self._mocked_date(date):
+            httpreq = await self.download_request(req)
+        assert (
+            httpreq.headers["Authorization"]
+            == b"AWS 0PN5J17HBGZHT7JJ3X82:xXjDGYUmKxnwqr5KXNPGldn5LbA="
+        )
+
+    @coroutine_test
+    async def test_request_signing2(self):
+        # puts an object into the johnsmith bucket.
+        date = "Tue, 27 Mar 2007 21:15:45 +0000"
+        req = Request(
+            "s3://johnsmith/photos/puppy.jpg",
+            method="PUT",
+            headers={
+                "Content-Type": "image/jpeg",
+                "Date": date,
+                "Content-Length": "94328",
+            },
+        )
+        with self._mocked_date(date):
+            httpreq = await self.download_request(req)
+        assert (
+            httpreq.headers["Authorization"]
+            == b"AWS 0PN5J17HBGZHT7JJ3X82:hcicpDDvL9SsO6AkvxqmIWkmOuQ="
+        )
+
+    @coroutine_test
+    async def test_request_signing3(self):
+        # lists the content of the johnsmith bucket.
+        date = "Tue, 27 Mar 2007 19:42:41 +0000"
+        req = Request(
+            "s3://johnsmith/?prefix=photos&max-keys=50&marker=puppy",
+            method="GET",
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Date": date,
+            },
+        )
+        with self._mocked_date(date):
+            httpreq = await self.download_request(req)
+        assert (
+            httpreq.headers["Authorization"]
+            == b"AWS 0PN5J17HBGZHT7JJ3X82:jsRt/rhG+Vtp88HrYL706QhE4w4="
+        )
+
+    @coroutine_test
+    async def test_request_signing4(self):
+        # fetches the access control policy sub-resource for the 'johnsmith' bucket.
+        date = "Tue, 27 Mar 2007 19:44:46 +0000"
+        req = Request("s3://johnsmith/?acl", method="GET", headers={"Date": date})
+        with self._mocked_date(date):
+            httpreq = await self.download_request(req)
+        assert (
+            httpreq.headers["Authorization"]
+            == b"AWS 0PN5J17HBGZHT7JJ3X82:thdUi9VAkzhkniLj96JIrOPGi0g="
+        )
+
+    @coroutine_test
+    async def test_request_signing6(self):
+        # uploads an object to a CNAME style virtual hosted bucket with metadata.
+        date = "Tue, 27 Mar 2007 21:06:08 +0000"
+        req = Request(
+            "s3://static.johnsmith.net:8080/db-backup.dat.gz",
+            method="PUT",
+            headers={
+                "User-Agent": "curl/7.15.5",
+                "Host": "static.johnsmith.net:8080",
+                "Date": date,
+                "x-amz-acl": "public-read",
+                "content-type": "application/x-download",
+                "Content-MD5": "4gJE4saaMU4BqNR0kLY+lw==",
+                "X-Amz-Meta-ReviewedBy": "joe@johnsmith.net,jane@johnsmith.net",
+                "X-Amz-Meta-FileChecksum": "0x02661779",
+                "X-Amz-Meta-ChecksumAlgorithm": "crc32",
+                "Content-Disposition": "attachment; filename=database.dat",
+                "Content-Encoding": "gzip",
+                "Content-Length": "5913339",
+            },
+        )
+        with self._mocked_date(date):
+            httpreq = await self.download_request(req)
+        assert (
+            httpreq.headers["Authorization"]
+            == b"AWS 0PN5J17HBGZHT7JJ3X82:C0FlOtU8Ylb9KDTpZqYkZPX91iI="
+        )
+
+    @coroutine_test
+    async def test_request_signing7(self):
+        # ensure that spaces are quoted properly before signing
+        date = "Tue, 27 Mar 2007 19:42:41 +0000"
+        req = Request(
+            "s3://johnsmith/photos/my puppy.jpg?response-content-disposition=my puppy.jpg",
+            method="GET",
+            headers={"Date": date},
+        )
+        with self._mocked_date(date):
+            httpreq = await self.download_request(req)
+        assert (
+            httpreq.headers["Authorization"]
+            == b"AWS 0PN5J17HBGZHT7JJ3X82:+CfvG8EZ3YccOrRVMXNaK2eKZmM="
+        )
+
+
+@pytest.mark.skipif(is_botocore_available(), reason="Requires not having botocore")
+def test_s3_no_botocore() -> None:
+    crawler = get_crawler()
+    with pytest.raises(NotConfigured, match="missing botocore library"):
+        build_from_crawler(S3DownloadHandler, crawler)
+
+
+class TestDataURI:
+    def setup_method(self):
+        crawler = get_crawler()
+        download_handler = build_from_crawler(DataURIDownloadHandler, crawler)
+        self.download_request = download_handler.download_request
+
+    @coroutine_test
+    async def test_response_attrs(self):
+        uri = "data:,A%20brief%20note"
+        request = Request(uri)
+        response = await self.download_request(request)
+        assert response.url == uri
+        assert not response.headers
+
+    @coroutine_test
+    async def test_default_mediatype_encoding(self):
+        request = Request("data:,A%20brief%20note")
+        response = await self.download_request(request)
+        assert response.text == "A brief note"
+        assert type(response) is responsetypes.from_mimetype("text/plain")
+        assert isinstance(response, TextResponse)
+        assert response.encoding == "US-ASCII"
+
+    @coroutine_test
+    async def test_default_mediatype(self):
+        request = Request("data:;charset=iso-8859-7,%be%d3%be")
+        response = await self.download_request(request)
+        assert response.text == "\u038e\u03a3\u038e"
+        assert type(response) is responsetypes.from_mimetype("text/plain")
+        assert isinstance(response, TextResponse)
+        assert response.encoding == "iso-8859-7"
+
+    @coroutine_test
+    async def test_text_charset(self):
+        request = Request("data:text/plain;charset=iso-8859-7,%be%d3%be")
+        response = await self.download_request(request)
+        assert response.text == "\u038e\u03a3\u038e"
+        assert response.body == b"\xbe\xd3\xbe"
+        assert isinstance(response, TextResponse)
+        assert response.encoding == "iso-8859-7"
+
+    @coroutine_test
+    async def test_mediatype_parameters(self):
+        request = Request(
+            "data:text/plain;foo=%22foo;bar%5C%22%22;"
+            "charset=utf-8;bar=%22foo;%5C%22 foo ;/,%22"
+            ",%CE%8E%CE%A3%CE%8E"
+        )
+        response = await self.download_request(request)
+        assert response.text == "\u038e\u03a3\u038e"
+        assert type(response) is responsetypes.from_mimetype("text/plain")
+        assert isinstance(response, TextResponse)
+        assert response.encoding == "utf-8"
+
+    @coroutine_test
+    async def test_base64(self):
+        request = Request("data:text/plain;base64,SGVsbG8sIHdvcmxkLg%3D%3D")
+        response = await self.download_request(request)
+        assert response.text == "Hello, world."
+
+    @coroutine_test
+    async def test_binary_mediatype(self):
+        request = Request("data:image/png;base64,iVBORw0KGgo%3D")
+        response = await self.download_request(request)
+        assert response.body == b"\x89PNG\r\n\x1a\n"
+        assert type(response) is responsetypes.from_mimetype("image/png")
+        assert not isinstance(response, TextResponse)
+
+    @coroutine_test
+    async def test_protocol(self):
+        request = Request("data:,")
+        response = await self.download_request(request)
+        assert response.protocol is None
+
+
+class TestWrapTwistedExceptions:
+    """Every Twisted exception the HTTP handlers can raise has a Scrapy equivalent.
+
+    Most mappings are also covered end to end by the HTTP handler tests, but a
+    Twisted ``TimeoutError`` needs a connection attempt that is silently dropped
+    rather than refused, which no mock server can offer reliably.
+    """
+
+    @pytest.mark.parametrize(
+        ("twisted_exception", "scrapy_exception"),
+        [
+            (SchemeNotSupported, UnsupportedURLSchemeError),
+            (CancelledError, DownloadCancelledError),
+            (TxConnectionRefusedError, DownloadConnectionRefusedError),
+            (DNSLookupError, CannotResolveHostError),
+            (ResponseFailed, DownloadFailedError),
+            (TxTimeoutError, DownloadTimeoutError),
+        ],
+    )
+    def test_mapping(
+        self,
+        twisted_exception: type[Exception],
+        scrapy_exception: type[Exception],
+    ) -> None:
+        original = twisted_exception("some message")
+        with pytest.raises(scrapy_exception) as exc_info, wrap_twisted_exceptions():
+            raise original
+        assert exc_info.value.__cause__ is original
+        assert str(exc_info.value) == str(original)
+
+    def test_other_exceptions_pass_through(self) -> None:
+        with pytest.raises(ZeroDivisionError), wrap_twisted_exceptions():
+            1 / 0

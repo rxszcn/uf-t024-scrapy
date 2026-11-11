@@ -1,0 +1,283 @@
+.. _topics-leaks:
+
+======================
+Debugging memory leaks
+======================
+
+In Scrapy, objects such as requests, responses and items have a finite
+lifetime: they are created, used for a while and finally destroyed.
+
+Of all those objects, the Request usually has the longest lifetime because it
+waits in the Scheduler queue until it's time to process it. For more
+information, see :ref:`topics-architecture`.
+
+Because these Scrapy objects have a comparatively long lifetime, there is
+always the risk of accumulating them in memory without releasing them properly
+and thus causing what is known as a "memory leak".
+
+To help debug memory leaks, Scrapy provides a built-in mechanism for tracking
+object references called :ref:`trackref <topics-leaks-trackrefs>`, and you can
+also use a third-party library called :ref:`muppy <topics-leaks-muppy>` for
+more advanced memory debugging (see below for more information). Both
+mechanisms must be used after :ref:`connecting to a live crawl
+<connect-live-crawl>`.
+
+Common causes of memory leaks
+=============================
+
+It happens quite often (sometimes by accident, sometimes on purpose) that the
+Scrapy developer passes objects referenced in requests—for example, through the
+:attr:`~scrapy.Request.cb_kwargs` or :attr:`~scrapy.Request.meta` attributes or
+the request callback function—and that effectively ties the lifetime of those
+referenced objects to the lifetime of the request. This is, by far, the most
+common cause of memory leaks in Scrapy projects, and it can be quite difficult
+for newcomers to debug.
+
+In big projects, spiders are typically written by different people, and some of
+those spiders could be "leaking" and thus affecting the rest of the
+(well-written) spiders when they run concurrently, which, in turn, affects the
+whole crawling process.
+
+The leak could also come from a custom middleware, pipeline, or extension that
+you wrote if you are not releasing the previously allocated resources properly.
+For example, allocating resources on :signal:`spider_opened` but not releasing
+them on :signal:`spider_closed` may cause problems if you're running
+:ref:`multiple spiders per process <run-multiple-spiders>`.
+
+Too Many Requests?
+------------------
+
+By default Scrapy keeps the request queue in memory; it includes
+:class:`~scrapy.Request` objects and all objects referenced in request
+attributes (for example, :attr:`~scrapy.Request.cb_kwargs` and
+:attr:`~scrapy.Request.meta`). While this is not necessarily a leak, it can
+consume a lot of memory. Enabling the :ref:`persistent job queue <topics-jobs>`
+can help keep memory usage under control.
+
+.. _topics-leaks-trackrefs:
+
+Debugging memory leaks with ``trackref``
+========================================
+
+.. skip: start
+
+:mod:`scrapy.utils.trackref` is a module provided by Scrapy to debug the most
+common cases of memory leaks. It tracks the references to all live Request,
+Response, Item, Spider and Selector objects.
+
+You can enter the telnet console and inspect how many objects (of the classes
+mentioned above) are currently alive using the ``prefs()`` function which is an
+alias to the :func:`~scrapy.utils.trackref.print_live_refs` function:
+
+.. code-block:: bash
+
+    telnet localhost 6023
+
+.. code-block:: pycon
+
+    >>> prefs()
+    Live References
+
+    ExampleSpider                       1   oldest: 15s ago
+    HtmlResponse                       10   oldest: 1s ago
+    Selector                            2   oldest: 0s ago
+    Request                           878   oldest: 7s ago
+
+As you can see, that report also shows the "age" of the oldest object in each
+class. If you're running multiple spiders per process, chances are you can
+figure out which spider is leaking by looking at the oldest request or
+response. You can get the oldest object of each class using the
+:func:`~scrapy.utils.trackref.get_oldest` function (from the telnet console).
+
+Which objects are tracked?
+--------------------------
+
+``trackref`` tracks objects from these classes (and all their subclasses):
+
+* :class:`scrapy.Request`
+* :class:`scrapy.http.Response`
+* :class:`scrapy.Item`
+* :class:`scrapy.Selector`
+* :class:`scrapy.Spider`
+
+A real example
+--------------
+
+Let's see a concrete example of a hypothetical case of memory leaks.
+Suppose we have some spider with a line similar to this one:
+
+.. code-block:: python
+
+    return Request(
+        f"http://www.somenastyspider.com/product.php?pid={product_id}",
+        callback=self.parse,
+        cb_kwargs={"referer": response},
+    )
+
+That line passes a response reference inside a request, which effectively ties
+the response lifetime to the request's lifetime, and that will definitely cause
+memory leaks.
+
+Let's see how we can discover the cause (without knowing it
+a priori, of course) by using the ``trackref`` tool.
+
+After the crawler is running for a few minutes and we notice its memory usage
+has grown a lot, we can enter its telnet console and check the live
+references:
+
+.. code-block:: pycon
+
+    >>> prefs()
+    Live References
+
+    SomenastySpider                     1   oldest: 15s ago
+    HtmlResponse                     3890   oldest: 265s ago
+    Selector                            2   oldest: 0s ago
+    Request                          3878   oldest: 250s ago
+
+The fact that there are so many live responses (and that they're so old) is
+definitely suspicious, as responses should have a relatively short lifetime
+compared to requests. The number of responses is similar to the number of
+requests, so it looks like they are tied in some way. We can now check the code
+of the spider to discover the line that is generating the leaks (passing
+response references inside requests).
+
+Sometimes extra information about live objects can be helpful.
+Let's check the oldest response:
+
+.. code-block:: pycon
+
+    >>> from scrapy.utils.trackref import get_oldest
+    >>> r = get_oldest("HtmlResponse")
+    >>> r.url
+    'http://www.somenastyspider.com/product.php?pid=123'
+
+If you want to iterate over all objects instead of getting only the oldest one,
+you can use the :func:`scrapy.utils.trackref.iter_all` function:
+
+.. code-block:: pycon
+
+    >>> from scrapy.utils.trackref import iter_all
+    >>> [r.url for r in iter_all("HtmlResponse")]
+    ['http://www.somenastyspider.com/product.php?pid=123',
+    'http://www.somenastyspider.com/product.php?pid=584',
+    ...]
+
+Too many spiders?
+-----------------
+
+If your project has too many spiders executed in parallel, the output of
+``prefs()`` can be difficult to read. For this reason, that function has an
+``ignore`` argument that you can use to omit a particular class (and all its
+subclasses). For example, this won't show any live references to spiders:
+
+.. code-block:: pycon
+
+    >>> from scrapy.spiders import Spider
+    >>> prefs(ignore=Spider)
+
+.. module:: scrapy.utils.trackref
+
+scrapy.utils.trackref module
+----------------------------
+
+Here are the functions available in the :mod:`~scrapy.utils.trackref` module.
+
+.. autoclass:: object_ref
+
+.. autofunction:: print_live_refs(ignore=NoneType)
+
+.. autofunction:: get_oldest
+
+.. autofunction:: iter_all
+
+.. skip: end
+
+.. _topics-leaks-muppy:
+
+Debugging memory leaks with muppy
+=================================
+
+``trackref`` provides a convenient mechanism for tracking down memory leaks,
+but it only keeps track of the objects that are more likely to cause them.
+However, sometimes leaks come from other (more or less obscure) objects. If
+that happens and you can't find your leaks using ``trackref``, you still have
+another resource: the muppy library.
+
+muppy is available as part of `Pympler`_.
+
+.. _Pympler: https://pypi.org/project/Pympler/
+
+If you use ``pip``, you can install muppy with the following command::
+
+    pip install Pympler
+
+Here's an example that shows all Python objects available in the heap using
+muppy:
+
+.. skip: start
+.. code-block:: pycon
+
+    >>> from pympler import muppy
+    >>> all_objects = muppy.get_objects()
+    >>> len(all_objects)
+    28667
+    >>> from pympler import summary
+    >>> suml = summary.summarize(all_objects)
+    >>> summary.print_(suml)
+                                   types |   # objects |   total size
+    ==================================== | =========== | ============
+                             <class 'str |        9822 |      1.10 MB
+                            <class 'dict |        1658 |    856.62 KB
+                            <class 'type |         436 |    443.60 KB
+                            <class 'code |        2974 |    419.56 KB
+              <class '_io.BufferedWriter |           2 |    256.34 KB
+                             <class 'set |         420 |    159.88 KB
+              <class '_io.BufferedReader |           1 |    128.17 KB
+              <class 'wrapper_descriptor |        1130 |     88.28 KB
+                           <class 'tuple |        1304 |     86.57 KB
+                         <class 'weakref |        1013 |     79.14 KB
+      <class 'builtin_function_or_method |         958 |     67.36 KB
+               <class 'method_descriptor |         865 |     60.82 KB
+                     <class 'abc.ABCMeta |          62 |     59.96 KB
+                            <class 'list |         446 |     58.52 KB
+                             <class 'int |        1425 |     43.20 KB
+
+.. skip: end
+
+For more information about muppy, refer to the `muppy documentation`_.
+
+.. _muppy documentation: https://pythonhosted.org/Pympler/muppy.html
+
+.. _topics-leaks-without-leaks:
+
+Leaks without leaks
+===================
+
+Sometimes you may notice that the memory usage of your Scrapy process only
+increases and never decreases. Unfortunately, this could happen even though
+neither Scrapy nor your project are leaking memory. This is due to a
+not-so-well-known problem in Python, which may not return released memory to
+the operating system in some cases. For more information on this issue see:
+
+* `Python Memory Management <https://www.evanjones.ca/python-memory.html>`_
+* `Python Memory Management Part 2 <https://www.evanjones.ca/python-memory-part2.html>`_
+* `Python Memory Management Part 3 <https://www.evanjones.ca/python-memory-part3.html>`_
+
+The improvements proposed by Evan Jones, which are detailed in `this paper`_,
+got merged in Python 2.5, but this only reduces the problem, it doesn't fix it
+completely. To quote the paper:
+
+    *Unfortunately, this patch can only free an arena if there are no more
+    objects allocated in it anymore. This means that fragmentation is a large
+    issue. An application could have many megabytes of free memory, scattered
+    throughout all the arenas, but it will be unable to free any of it. This is
+    a problem experienced by all memory allocators. The only way to solve it is
+    to move to a compacting garbage collector, which is able to move objects in
+    memory. This would require significant changes to the Python interpreter.*
+
+.. _this paper: https://www.evanjones.ca/memoryallocator/
+
+To keep memory consumption reasonable, you can split the job into several
+smaller jobs or enable the :ref:`persistent job queue <topics-jobs>` and stop
+and start the spider from time to time.

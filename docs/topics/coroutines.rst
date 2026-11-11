@@ -1,0 +1,316 @@
+.. _topics-coroutines:
+
+==========
+Coroutines
+==========
+
+Scrapy :ref:`supports <coroutine-support>` the :ref:`coroutine syntax <async>`
+(i.e. ``async def``).
+
+
+.. _coroutine-support:
+
+Supported callables
+===================
+
+The following callables may be defined as coroutines using ``async def``, and
+hence use coroutine syntax (e.g. ``await``, ``async for``, ``async with``):
+
+-   The :meth:`~scrapy.Spider.start` spider method, which *must* be
+    defined as an :term:`asynchronous generator`.
+
+    .. versionadded:: 2.13
+
+-   :class:`~scrapy.Request` :ref:`callbacks <callbacks>`, which may
+    also be defined as :term:`asynchronous generators <asynchronous
+    generator>`.
+
+-   The :meth:`process_item` method of
+    :ref:`item pipelines <topics-item-pipeline>`.
+
+-   The
+    :meth:`~scrapy.downloadermiddlewares.DownloaderMiddleware.process_request`,
+    :meth:`~scrapy.downloadermiddlewares.DownloaderMiddleware.process_response`,
+    and
+    :meth:`~scrapy.downloadermiddlewares.DownloaderMiddleware.process_exception`
+    methods of
+    :ref:`downloader middlewares <topics-downloader-middleware-custom>`.
+
+-   The
+    :meth:`~scrapy.spidermiddlewares.SpiderMiddleware.process_spider_output`
+    method of :ref:`spider middlewares <topics-spider-middleware>`, which
+    *must* be defined as an :term:`asynchronous generator` except in
+    :ref:`universal spider middlewares <universal-spider-middleware>`.
+
+-   The :meth:`~scrapy.spidermiddlewares.SpiderMiddleware.process_start` method
+    of :ref:`spider middlewares <custom-spider-middleware>`, which *must* be
+    defined as an :term:`asynchronous generator`.
+
+    .. versionadded:: 2.13
+
+-   :ref:`Signal handlers that support deferreds <signal-deferred>`.
+
+-   Methods of :ref:`download handlers <topics-download-handlers>`.
+
+    .. versionadded:: 2.14
+
+-   The following methods of :ref:`item exporters <topics-exporters>`, when the
+    exporter is used by the :ref:`feed exports <topics-feed-exports>`:
+
+    - :meth:`~scrapy.exporters.BaseItemExporter.start_exporting`
+
+    - :meth:`~scrapy.exporters.BaseItemExporter.export_item`
+
+    - :meth:`~scrapy.exporters.BaseItemExporter.finish_exporting`
+
+    .. versionadded:: 2.20.0
+
+-   Methods of :ref:`custom feed storages <topics-feed-storage-custom>` (see
+    :setting:`FEED_STORAGES`):
+
+    - :meth:`~scrapy.extensions.feedexport.FeedStorageProtocol.open`
+
+    - :meth:`~scrapy.extensions.feedexport.FeedStorageProtocol.store`
+
+    .. versionadded:: 2.20.0
+
+-   The following methods of subclasses of
+    :class:`scrapy.pipelines.media.MediaPipeline`:
+
+    - ``media_to_download()``
+
+      .. versionadded:: 2.14
+
+    - ``media_downloaded()``
+
+      .. versionadded:: 2.15
+
+    - ``file_downloaded()``, in subclasses of
+      :class:`scrapy.pipelines.files.FilesPipeline`
+
+      .. versionadded:: 2.15
+
+    - ``item_completed()``
+
+      .. versionadded:: 2.20.0
+
+-   The following methods of :ref:`custom media storages
+    <media-pipeline-custom-storage>`:
+
+    - ``persist_file()``
+
+      .. versionadded:: 2.15
+
+    - ``stat_file()``
+
+      .. versionadded:: 2.20.0
+
+-   The ``open()`` and ``close()`` methods of :ref:`custom schedulers
+    <topics-scheduler>` (see :setting:`SCHEDULER`).
+
+    .. versionadded:: VERSION
+
+-   The ``open()`` and ``close()`` methods of custom dupefilters (see
+    :setting:`DUPEFILTER_CLASS`).
+
+    .. versionadded:: VERSION
+
+Most callables above may also :ref:`await a request <inline-requests>` to send
+it and get its response.
+
+.. versionadded:: 2.20.0
+
+
+.. _coroutine-deferred-apis:
+
+Using Deferred-based APIs
+=========================
+
+In addition to native coroutine APIs, Scrapy has some APIs that return a
+:class:`~twisted.internet.defer.Deferred` object or take a user-supplied
+function that returns a :class:`~twisted.internet.defer.Deferred` object. These
+APIs are also asynchronous but don't yet support native ``async def`` syntax.
+In the future we plan to add support for the ``async def`` syntax to these APIs
+or replace them with other APIs where changing the existing ones isn't
+possible.
+
+These APIs have a coroutine-based implementation and a Deferred-based one, to
+make it easier to write Deferred-based code; the Deferred-based ones will be
+deprecated in a future Scrapy version:
+
+-   :meth:`~scrapy.crawler.Crawler.crawl_async` (coroutine-based) and
+    :meth:`~scrapy.crawler.Crawler.crawl` (Deferred-based)
+
+-   :class:`scrapy.crawler.AsyncCrawlerRunner` and its subclass
+    :class:`scrapy.crawler.AsyncCrawlerProcess` (coroutine-based) and
+    :class:`scrapy.crawler.CrawlerRunner` and its subclass
+    :class:`scrapy.crawler.CrawlerProcess` (Deferred-based)
+
+The following user-supplied methods can return
+:class:`~twisted.internet.defer.Deferred` objects (the methods that can also
+return coroutines are listed in :ref:`coroutine-support`):
+
+-   Custom downloader implementations (see :setting:`DOWNLOADER`):
+
+    - ``fetch()``
+
+In most cases, you can use these APIs in code that otherwise uses coroutines by
+wrapping a :class:`~twisted.internet.defer.Deferred` object into a
+:class:`~asyncio.Future` object or vice versa. See :ref:`asyncio-await-dfd` for
+more information about this.
+
+
+General usage
+=============
+
+There are several use cases for coroutines in Scrapy.
+
+Code that would return Deferreds when written for previous Scrapy versions,
+such as downloader middlewares and signal handlers, can be rewritten to be
+shorter and cleaner:
+
+.. code-block:: python
+
+    from itemadapter import ItemAdapter
+
+
+    class DbPipeline:
+        def _update_item(self, data, item):
+            adapter = ItemAdapter(item)
+            adapter["field"] = data
+            return item
+
+        def process_item(self, item):
+            adapter = ItemAdapter(item)
+            dfd = db.get_some_data(adapter["id"])
+            dfd.addCallback(self._update_item, item)
+            return dfd
+
+becomes:
+
+.. code-block:: python
+
+    from itemadapter import ItemAdapter
+    from scrapy.utils.defer import deferred_to_future
+
+
+    class DbPipeline:
+        async def process_item(self, item):
+            adapter = ItemAdapter(item)
+            adapter["field"] = await deferred_to_future(db.get_some_data(adapter["id"]))
+            return item
+
+Coroutines may be used to call asynchronous code. This includes other
+coroutines, functions that return Deferreds and functions that return
+:term:`awaitable objects <awaitable>` such as :class:`~asyncio.Future`. This
+means you can use many useful Python libraries that provide such code:
+
+.. skip: next
+.. code-block:: python
+
+    class MySpiderDeferred(Spider):
+        # ...
+        async def parse(self, response):
+            additional_response = await deferred_to_future(
+                treq.get("https://additional.url")
+            )
+            additional_data = await deferred_to_future(treq.content(additional_response))
+            # ... use response and additional_data to yield items and requests
+
+
+    class MySpiderAsyncio(Spider):
+        # ...
+        async def parse(self, response):
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://additional.url") as additional_response:
+                    additional_data = await additional_response.text()
+            # ... use response and additional_data to yield items and requests
+
+.. note:: If you want to ``await`` on Deferreds, you need to :ref:`wrap them
+    <asyncio-await-dfd>`.
+
+Sometimes you need to call code that is not async-friendly at all, such as a
+third-party client library with no asynchronous support. Calling such code
+directly from a coroutine would block the underlying event loop, preventing
+Scrapy from doing any other work while it runs. To avoid this, you can wrap
+the blocking call with :func:`asyncio.to_thread`, which runs it in a separate
+thread and returns an awaitable with the result (see :ref:`optimize-blocking`
+for an example).
+
+Common use cases for asynchronous code include:
+
+* requesting data from websites, databases and other services (in
+  :meth:`~scrapy.Spider.start`, callbacks, pipelines and middlewares;
+  see :ref:`inline-requests` and the :ref:`screenshot pipeline example
+  <ScreenshotPipeline>`);
+* storing data in databases (in pipelines and middlewares);
+* delaying the spider initialization until some external event (in the
+  :signal:`spider_opened` handler).
+
+
+.. _inline-requests:
+
+Inline requests
+===============
+
+The spider below shows how to send a request and await its response all from
+within a spider callback:
+
+.. versionadded:: 2.20.0
+    Awaiting a :class:`~scrapy.Request` object.
+
+.. code-block:: python
+
+    from scrapy import Spider, Request
+
+
+    class SingleRequestSpider(Spider):
+        name = "single"
+        start_urls = ["https://example.org/product"]
+
+        async def parse(self, response, **kwargs):
+            additional_response = await Request("https://example.org/price")
+            yield {
+                "h1": response.css("h1").get(),
+                "price": additional_response.css("#price").get(),
+            }
+
+Awaiting a request sends it and returns its response. Only downloader
+middlewares apply.
+
+You may await a request wherever :ref:`coroutine syntax is supported
+<coroutine-support>`, except in :ref:`download handlers
+<topics-download-handlers>` and in code that runs after a closing spider has
+finished its last requests, such as :signal:`spider_closed` handlers.
+
+You may only await a request while its *callback* and *errback* are unset;
+awaiting sets its *callback* to :func:`~scrapy.http.request.NO_CALLBACK`.
+
+For a request that you did not build yourself, and that may already have a
+*callback* or an *errback*, use :meth:`ExecutionEngine.download_async()
+<scrapy.core.engine.ExecutionEngine.download_async>`, which sends the request
+as is.
+
+You can also send multiple requests in parallel:
+
+.. code-block:: python
+
+    import asyncio
+
+    from scrapy import Spider, Request
+
+
+    class MultipleRequestsSpider(Spider):
+        name = "multiple"
+        start_urls = ["https://example.com/product"]
+
+        async def parse(self, response, **kwargs):
+            responses = await asyncio.gather(
+                Request("https://example.com/price"),
+                Request("https://example.com/color"),
+            )
+            yield {
+                "h1": response.css("h1::text").get(),
+                "price": responses[0].css(".price::text").get(),
+                "color": responses[1].css(".color::text").get(),
+            }

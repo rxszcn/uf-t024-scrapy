@@ -1,0 +1,452 @@
+.. _faq:
+
+Frequently Asked Questions
+==========================
+
+.. _faq-scrapy-bs-cmp:
+
+How does Scrapy compare to BeautifulSoup or lxml?
+-------------------------------------------------
+
+`BeautifulSoup`_ and `lxml`_ are libraries for parsing HTML and XML. Scrapy is
+an application framework for writing web spiders that crawl web sites and
+extract data from them.
+
+Scrapy provides a built-in mechanism for extracting data (called
+:ref:`selectors <topics-selectors>`) but you can easily use `BeautifulSoup`_
+(or `lxml`_) instead, if you feel more comfortable working with them. After
+all, they're just parsing libraries which can be imported and used from any
+Python code.
+
+In other words, comparing `BeautifulSoup`_ (or `lxml`_) to Scrapy is like
+comparing `jinja2`_ to `Django`_.
+
+.. _BeautifulSoup: https://www.crummy.com/software/BeautifulSoup/
+.. _lxml: https://lxml.de/
+.. _jinja2: https://palletsprojects.com/projects/jinja/
+.. _Django: https://www.djangoproject.com/
+
+Can I use Scrapy with BeautifulSoup?
+------------------------------------
+
+Yes, you can.
+As mentioned :ref:`above <faq-scrapy-bs-cmp>`, `BeautifulSoup`_ can be used
+for parsing HTML responses in Scrapy callbacks.
+You just have to feed the response's body into a ``BeautifulSoup`` object
+and extract whatever data you need from it.
+
+Here's an example spider using BeautifulSoup API, with ``lxml`` as the HTML parser:
+
+.. skip: next
+.. code-block:: python
+
+    from bs4 import BeautifulSoup
+    import scrapy
+
+
+    class ExampleSpider(scrapy.Spider):
+        name = "example"
+        allowed_domains = ["example.com"]
+        start_urls = ("http://www.example.com/",)
+
+        def parse(self, response):
+            # use lxml to get decent HTML parsing speed
+            soup = BeautifulSoup(response.text, "lxml")
+            yield {"url": response.url, "title": soup.h1.string}
+
+.. note::
+
+    ``BeautifulSoup`` supports several HTML/XML parsers.
+    See `BeautifulSoup's official documentation`_ on which ones are available.
+
+.. _BeautifulSoup's official documentation: https://www.crummy.com/software/BeautifulSoup/bs4/doc/#specifying-the-parser-to-use
+
+
+Did Scrapy "steal" X from Django?
+---------------------------------
+
+Probably, but we don't like that word. We think Django_ is a great open source
+project and an example to follow, so we've used it as an inspiration for
+Scrapy.
+
+We believe that, if something is already done well, there's no need to reinvent
+it. This concept, besides being one of the foundations for open source and free
+software, not only applies to software but also to documentation, procedures,
+policies, etc. So, instead of going through each problem ourselves, we choose
+to copy ideas from those projects that have already solved them properly, and
+focus on the real problems we need to solve.
+
+We'd be proud if Scrapy serves as an inspiration for other projects. Feel free
+to steal from us!
+
+Does Scrapy work with HTTP proxies?
+-----------------------------------
+
+Yes. Support for HTTP proxies is provided through the HTTP Proxy downloader
+middleware. See
+:class:`~scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware`.
+
+Does Scrapy work with SOCKS proxies?
+------------------------------------
+
+Yes, when using
+:class:`~scrapy.core.downloader.handlers._httpx.HttpxDownloadHandler`. See
+:class:`~scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware` and the
+handler documentation.
+
+How can I scrape an item with attributes in different pages?
+------------------------------------------------------------
+
+See :ref:`callback-data`.
+
+How can I simulate a user login in my spider?
+---------------------------------------------
+
+See :ref:`topics-request-response-ref-request-userlogin`.
+
+
+.. _faq-bfo-dfo:
+
+Does Scrapy crawl in breadth-first or depth-first order?
+--------------------------------------------------------
+
+:ref:`DFO by default, but other orders are possible <request-order>`.
+
+
+My Scrapy crawler has memory leaks. What can I do?
+--------------------------------------------------
+
+See :ref:`topics-leaks`.
+
+Also, Python has a built-in memory leak issue which is described in
+:ref:`topics-leaks-without-leaks`.
+
+How can I make Scrapy consume less memory?
+------------------------------------------
+
+See previous question.
+
+How can I prevent memory errors due to many allowed domains?
+------------------------------------------------------------
+
+If you have a spider with a long list of :attr:`~scrapy.Spider.allowed_domains`
+(e.g. 50,000+), consider replacing the default
+:class:`~scrapy.downloadermiddlewares.offsite.OffsiteMiddleware` downloader
+middleware with a :ref:`custom downloader middleware
+<topics-downloader-middleware-custom>` that requires less memory. For example:
+
+-   If your domain names are similar enough, use your own regular expression
+    instead of joining the strings in :attr:`~scrapy.Spider.allowed_domains`
+    into a complex regular expression.
+
+-   If you can meet the installation requirements, use pyre2_ instead of
+    Python’s re_ to compile your URL-filtering regular expression. See
+    :gh:`1908`.
+
+See also `other suggestions at StackOverflow
+<https://stackoverflow.com/q/36440681>`__.
+
+.. note:: Remember to disable
+   :class:`scrapy.downloadermiddlewares.offsite.OffsiteMiddleware` when you
+   enable your custom implementation:
+
+   .. code-block:: python
+
+       DOWNLOADER_MIDDLEWARES = {
+           "scrapy.downloadermiddlewares.offsite.OffsiteMiddleware": None,
+           "myproject.middlewares.CustomOffsiteMiddleware": 50,
+       }
+
+.. _pyre2: https://github.com/andreasvc/pyre2
+.. _re: https://docs.python.org/3/library/re.html
+
+Can I use Basic HTTP Authentication in my spiders?
+--------------------------------------------------
+
+Yes, see :class:`~scrapy.downloadermiddlewares.httpauth.HttpAuthMiddleware`.
+
+Can I sign my requests with OAuth?
+----------------------------------
+
+Yes, see :ref:`mw-oauth`.
+
+Why does Scrapy download pages in English instead of my native language?
+------------------------------------------------------------------------
+
+Try changing the default `Accept-Language`_ request header by overriding the
+:setting:`DEFAULT_REQUEST_HEADERS` setting.
+
+.. _Accept-Language: https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.4
+
+Where can I find some example Scrapy projects?
+----------------------------------------------
+
+See :ref:`intro-examples`.
+
+Can I run a spider without creating a project?
+----------------------------------------------
+
+Yes. You can use the :command:`runspider` command. For example, if you have a
+spider written in a ``my_spider.py`` file you can run it with::
+
+    scrapy runspider my_spider.py
+
+See :command:`runspider` command for more info.
+
+I get "Filtered offsite request" messages. How can I fix them?
+--------------------------------------------------------------
+
+Those messages (logged with ``DEBUG`` level) don't necessarily mean there is a
+problem, so you may not need to fix them.
+
+Those messages are thrown by
+:class:`~scrapy.downloadermiddlewares.offsite.OffsiteMiddleware`, which is a
+downloader middleware (enabled by default) whose purpose is to filter out
+requests to domains outside the ones covered by the spider.
+
+What is the recommended way to deploy a Scrapy crawler in production?
+---------------------------------------------------------------------
+
+See :ref:`topics-deploy`.
+
+Can I use JSON for large exports?
+---------------------------------
+
+It'll depend on how large your output is. See :ref:`this warning
+<json-with-large-data>` in :class:`~scrapy.exporters.JsonItemExporter`
+documentation.
+
+Can I return (Twisted) deferreds from signal handlers?
+------------------------------------------------------
+
+Some signals support returning deferreds from their handlers, others don't. See
+the :ref:`topics-signals-ref` to know which ones.
+
+What does the response status code 999 mean?
+--------------------------------------------
+
+999 is a custom response status code used by some sites to throttle requests.
+Try slowing down the crawling speed by using a download delay of ``2`` (or
+higher) for the affected domains, with the :setting:`DOWNLOAD_SLOTS` setting:
+
+.. code-block:: python
+
+    DOWNLOAD_SLOTS = {
+        "example.com": {"delay": 2},
+    }
+
+Or by setting a global download delay in your project with the
+:setting:`DOWNLOAD_DELAY` setting.
+
+Can I call ``pdb.set_trace()`` from my spiders to debug them?
+-------------------------------------------------------------
+
+Yes, but you can also use the Scrapy shell which allows you to quickly analyze
+(and even modify) the response being processed by your spider, which is, quite
+often, more useful than plain old ``pdb.set_trace()``.
+
+For more info see :ref:`topics-shell-inspect-response`.
+
+You can also :ref:`connect to live crawls <connect-live-crawl>`, which is the
+best way to debug running spiders without adding breakpoints to their code in
+advance.
+
+Simplest way to dump all my scraped items into a JSON/CSV/XML file?
+-------------------------------------------------------------------
+
+To dump into a JSON file::
+
+    scrapy crawl myspider -O items.json
+
+To dump into a CSV file::
+
+    scrapy crawl myspider -O items.csv
+
+To dump into an XML file::
+
+    scrapy crawl myspider -O items.xml
+
+For more information see :ref:`topics-feed-exports`
+
+What's this huge cryptic ``__VIEWSTATE`` parameter used in some forms?
+----------------------------------------------------------------------
+
+The ``__VIEWSTATE`` parameter is used in sites built with ASP.NET/VB.NET. For
+more info on how it works see `this page`_. Also, here's an `example spider`_
+which scrapes one of these sites.
+
+.. _this page: https://metacpan.org/release/ECARROLL/HTML-TreeBuilderX-ASP_NET-0.09/view/lib/HTML/TreeBuilderX/ASP_NET.pm
+.. _example spider: https://github.com/AmbientLighter/rpn-fas/blob/master/fas/spiders/rnp.py
+
+What's the best way to parse big XML/CSV data feeds?
+----------------------------------------------------
+
+Parsing big feeds with XPath selectors can be problematic since they need to
+build the DOM of the entire feed in memory, and this can be quite slow and
+consume a lot of memory.
+
+In order to avoid parsing the entire feed at once in memory, you can use the
+:func:`~scrapy.utils.iterators.xmliter_lxml` and
+:func:`~scrapy.utils.iterators.csviter` functions. In fact, this is what
+:class:`~scrapy.spiders.XMLFeedSpider` and
+:class:`~scrapy.spiders.CSVFeedSpider` use.
+
+.. autofunction:: scrapy.utils.iterators.xmliter_lxml
+
+.. autofunction:: scrapy.utils.iterators.csviter
+
+Does Scrapy manage cookies automatically?
+-----------------------------------------
+
+Yes, Scrapy receives and keeps track of cookies sent by servers, and sends them
+back on subsequent requests, like any regular web browser does.
+
+For more info see :ref:`cookies`.
+
+How can I see the cookies being sent and received from Scrapy?
+--------------------------------------------------------------
+
+Enable the :setting:`COOKIES_DEBUG` setting.
+
+How can I instruct a spider to stop itself?
+-------------------------------------------
+
+Raise the :exc:`~scrapy.exceptions.CloseSpider` exception from a callback. For
+more info see: :exc:`~scrapy.exceptions.CloseSpider`.
+
+How can I prevent my Scrapy bot from getting banned?
+----------------------------------------------------
+
+See :ref:`bans`.
+
+Should I use spider arguments or settings to configure my spider?
+-----------------------------------------------------------------
+
+Both :ref:`spider arguments <spiderargs>` and :ref:`settings <topics-settings>`
+can be used to configure your spider. There is no strict rule that mandates
+using one or the other, but settings are more suited for parameters that, once
+set, don't change much, while spider arguments are meant to change more often,
+even on each spider run and sometimes are required for the spider to run at all
+(for example, to set the start url of a spider).
+
+To illustrate with an example, assuming you have a spider that needs to log
+into a site to scrape data, and you only want to scrape data from a certain
+section of the site (which varies each time). In that case, the credentials to
+log in would be settings, while the url of the section to scrape would be a
+spider argument.
+
+I'm scraping an XML document and my XPath selector doesn't return any items
+---------------------------------------------------------------------------
+
+You may need to remove namespaces. See :ref:`removing-namespaces`.
+
+
+.. _faq-split-item:
+
+How to split an item into multiple items in an item pipeline?
+-------------------------------------------------------------
+
+:ref:`Item pipelines <topics-item-pipeline>` cannot yield multiple items per
+input item. :ref:`Create a spider middleware <custom-spider-middleware>`
+instead, and use its
+:meth:`~scrapy.spidermiddlewares.SpiderMiddleware.process_spider_output`
+method for this purpose. For example:
+
+.. code-block:: python
+
+    from copy import deepcopy
+
+    from itemadapter import ItemAdapter
+    from scrapy import Request
+
+
+    class MultiplyItemsMiddleware:
+        def process_spider_output(self, response, result):
+            for item_or_request in result:
+                if isinstance(item_or_request, Request):
+                    yield item_or_request
+                    continue
+                adapter = ItemAdapter(item_or_request)
+                for _ in range(adapter["multiply_by"]):
+                    yield deepcopy(item_or_request)
+
+Does Scrapy support IPv6 addresses?
+-----------------------------------
+
+Yes, but when using
+:class:`~scrapy.core.downloader.handlers.http11.HTTP11DownloadHandler` or
+:class:`~scrapy.core.downloader.handlers.http2.H2DownloadHandler` you need to
+set :setting:`TWISTED_DNS_RESOLVER` to ``scrapy.resolver.CachingHostnameResolver``.
+Note that by doing so, you lose the ability to set a specific timeout for DNS requests
+(the value of the :setting:`DNS_TIMEOUT` setting is ignored).
+
+
+.. _faq-specific-reactor:
+
+How to deal with ``<class 'ValueError'>: filedescriptor out of range in select()`` exceptions?
+----------------------------------------------------------------------------------------------
+
+This issue `has been reported`_ to appear when running broad crawls in macOS, where the default
+Twisted reactor was :class:`twisted.internet.selectreactor.SelectReactor` at that time.
+If you are using this reactor explicitly, switch to the default one.
+
+
+.. _faq-stop-response-download:
+
+How can I cancel the download of a given response?
+--------------------------------------------------
+
+In some situations, it might be useful to stop the download of a certain response.
+For instance, sometimes you can determine whether or not you need the full contents
+of a response by inspecting its headers or the first bytes of its body. In that case,
+you could save resources by attaching a handler to the :class:`~scrapy.signals.bytes_received`
+or :class:`~scrapy.signals.headers_received` signals and raising a
+:exc:`~scrapy.exceptions.StopDownload` exception. Please refer to the
+:ref:`topics-stop-response-download` topic for additional information and examples.
+
+
+.. _faq-blank-request:
+
+How can I make a blank request?
+-------------------------------
+
+.. code-block:: python
+
+    from scrapy import Request
+
+    blank_request = Request("data:,")
+
+In this case, the URL is set to a data URI scheme. Data URLs allow you to include data
+inline within web pages, similar to external resources. The "data:" scheme with an empty
+content (",") essentially creates a request to a data URL without any specific content.
+
+
+.. _faq-too-many-open-files:
+
+I get ``too many file descriptors in select()`` or ``Too many open files``
+--------------------------------------------------------------------------
+
+The crawl is opening more sockets than the system allows. On Windows
+:func:`select.select` handles at most 512 sockets; elsewhere the ceiling is the
+maximum number of open files allowed for the process, which sockets, log files
+and feed exports all count towards.
+
+Lower :setting:`CONCURRENT_CONNECTIONS_PER_HANDLER`, keeping in mind that every
+:ref:`download handler <topics-download-handlers>` applies it on its own, so a
+crawl of both ``http://`` and ``https://`` URLs can open twice as many
+connections. Raising the limit of the operating system works as well on
+platforms other than Windows.
+
+
+Running ``runspider`` I get ``error: No spider found in file: <filename>``
+--------------------------------------------------------------------------
+
+This may happen if your Scrapy project has a spider module with a name that
+conflicts with the name of one of the `Python standard library modules`_, such
+as ``csv.py`` or ``os.py``, or any `Python package`_ that you have installed.
+See :gh:`2680`.
+
+
+.. _has been reported: https://github.com/scrapy/scrapy/issues/2905
+.. _Python standard library modules: https://docs.python.org/3/py-modindex.html
+.. _Python package: https://pypi.org/

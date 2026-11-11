@@ -1,0 +1,216 @@
+.. _topics-api:
+
+========
+Core API
+========
+
+This section documents the Scrapy core API, and it's intended for developers of
+extensions and middlewares.
+
+.. _topics-api-crawler:
+
+Crawler API
+===========
+
+The main entry point to the Scrapy API is the :class:`~scrapy.crawler.Crawler`
+object, which :ref:`components <topics-components>` can :ref:`get for
+initialization <from-crawler>`. It provides access to all Scrapy core
+components, and it is the only way for components to access them and hook their
+functionality into Scrapy.
+
+.. module:: scrapy.crawler
+
+The Extension Manager is responsible for loading and keeping track of installed
+extensions, and it's configured through the :setting:`EXTENSIONS` setting,
+which contains a dictionary of all available extensions and their order similar
+to how you :ref:`configure the downloader middlewares
+<topics-downloader-middleware-setting>`.
+
+.. autoclass:: Crawler
+    :members: get_addon, get_downloader_middleware, get_extension,
+        get_item_pipeline, get_spider_middleware
+
+    The Crawler object must be instantiated with a
+    :class:`scrapy.Spider` subclass and a
+    :class:`scrapy.settings.Settings` object.
+
+    The :attr:`engine`, :attr:`extensions`, :attr:`logformatter`,
+    :attr:`request_fingerprinter` and :attr:`stats` attributes get their value
+    when the crawl starts, and raise :exc:`RuntimeError` when read before that.
+
+    .. versionchanged:: 2.18.0
+        Those attributes used to be ``None`` before getting their value.
+
+    .. attribute:: request_fingerprinter
+
+        The request fingerprint builder of this crawler.
+
+        This is used from extensions and middlewares to build short, unique
+        identifiers for requests. See :ref:`request-fingerprints`.
+
+    .. attribute:: settings
+
+        The settings manager of this crawler.
+
+        This is used by extensions & middlewares to access the Scrapy settings
+        of this crawler.
+
+        For an introduction on Scrapy settings see :ref:`topics-settings`.
+
+        For the API see :class:`~scrapy.settings.Settings` class.
+
+    .. attribute:: signals
+
+        The signals manager of this crawler.
+
+        This is used by extensions & middlewares to hook themselves into Scrapy
+        functionality.
+
+        For an introduction on signals see :ref:`topics-signals`.
+
+        For the API see :class:`~scrapy.signalmanager.SignalManager` class.
+
+    .. attribute:: stats
+
+        The stats collector of this crawler.
+
+        This is used from extensions & middlewares to record stats of their
+        behaviour, or access stats collected by other extensions.
+
+        For an introduction on stats collection see :ref:`topics-stats`.
+
+        For the API see :class:`~scrapy.statscollectors.StatsCollector` class.
+
+    .. autoattribute:: logformatter
+
+    .. attribute:: extensions
+
+        The extension manager that keeps track of enabled extensions.
+
+        Most extensions won't need to access this attribute.
+
+        For an introduction on extensions and a list of available extensions on
+        Scrapy see :ref:`topics-extensions`.
+
+    .. autoattribute:: engine
+
+    .. attribute:: spider
+
+        Spider currently being crawled. This is an instance of the spider class
+        provided while constructing the crawler, and it is created after the
+        arguments given in the :meth:`crawl` method.
+
+    .. automethod:: crawl_async
+
+    .. automethod:: crawl
+
+    .. automethod:: stop_async
+
+    .. automethod:: stop
+
+.. autoclass:: AsyncCrawlerRunner
+   :members:
+
+.. autoclass:: CrawlerRunner
+   :members:
+
+.. autoclass:: AsyncCrawlerProcess
+   :show-inheritance:
+   :members:
+   :inherited-members:
+
+.. autoclass:: CrawlerProcess
+   :show-inheritance:
+   :members:
+   :inherited-members:
+
+.. _topics-api-settings:
+
+Settings API
+============
+
+.. module:: scrapy.settings
+
+.. attribute:: SETTINGS_PRIORITIES
+
+    Dictionary that sets the key name and priority level of the default
+    settings priorities used in Scrapy.
+
+    Each item defines a settings entry point, giving it a code name for
+    identification and an integer priority. Greater priorities take more
+    precedence over lesser ones when setting and retrieving values in the
+    :class:`~scrapy.settings.Settings` class.
+
+    .. code-block:: python
+
+        SETTINGS_PRIORITIES = {
+            "default": 0,
+            "command": 10,
+            "addon": 15,
+            "project": 20,
+            "spider": 30,
+            "cmdline": 40,
+        }
+
+    For a detailed explanation on each settings sources, see:
+    :ref:`topics-settings`.
+
+.. autofunction:: get_settings_priority
+
+.. autofunction:: scrapy.utils.project.get_project_settings
+
+.. autoclass:: Settings
+   :show-inheritance:
+   :members:
+
+.. autoclass:: BaseSettings
+   :members:
+
+.. _topics-api-spiderloader:
+
+SpiderLoader API
+================
+
+.. module:: scrapy.spiderloader
+
+Custom spider loaders can be employed by specifying their path in the
+:setting:`SPIDER_LOADER_CLASS` project setting. They must implement
+:class:`SpiderLoaderProtocol`.
+
+.. autoclass:: SpiderLoaderProtocol
+    :members:
+
+.. autoclass:: SpiderLoader
+    :members:
+
+.. autoclass:: DummySpiderLoader
+
+.. _topics-api-signals:
+
+Signals API
+===========
+
+.. automodule:: scrapy.signalmanager
+    :members:
+    :undoc-members:
+
+.. _topics-api-stats:
+
+Stats Collector API
+===================
+
+There are several Stats Collectors available under the
+:mod:`scrapy.statscollectors` module and they all implement the Stats
+Collector API defined by the :class:`~scrapy.statscollectors.StatsCollector`
+class (which they all inherit from).
+
+Engine API
+==========
+
+.. autoclass:: scrapy.core.engine.ExecutionEngine()
+   :members: close_spider_async, download_async, needs_backout,
+      open_spider_async, response_active_size, running, scheduler, start_async,
+      state, stop_async
+
+.. autoclass:: scrapy.core.engine.EngineState
+   :members:

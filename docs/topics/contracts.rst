@@ -1,0 +1,159 @@
+.. _topics-contracts:
+
+================
+Spider Contracts
+================
+
+Testing spiders can get particularly annoying, and while nothing prevents you
+from writing unit tests, the task gets cumbersome quickly. Scrapy offers an
+integrated way of testing your spiders by the means of contracts.
+
+.. versionchanged:: 2.19.0
+   Added support for callbacks defined with ``async def``, including
+   :term:`asynchronous generators <asynchronous generator>`.
+
+This allows you to test each callback of your spider by hardcoding a sample URL
+and checking various constraints for how the callback processes the response.
+Each contract is prefixed with an ``@`` and included in the docstring. See the
+following example:
+
+.. code-block:: python
+
+    def parse(self, response):
+        """
+        This function parses a sample response. Some contracts are mingled
+        with this docstring.
+
+        @url http://www.example.com/s?field-keywords=selfish+gene
+        @returns items 1 16
+        @returns requests 0 0
+        @scrapes Title Author Year Price
+        """
+
+A callback docstring can also be split into several batches of contracts, one
+per paragraph separated by a blank line, and a batch may repeat ``@url`` to
+check the callback against more than one sample request:
+
+.. versionadded:: 2.20.0
+
+.. code-block:: python
+
+    def parse(self, response):
+        """
+        @url http://www.example.com/s?field-keywords=selfish+gene
+        @url http://www.example.com/s?field-keywords=hitchhikers+guide
+        @returns items 16 16
+
+        @url http://www.example.com/s?field-keywords=out+of+stock+item
+        @returns items 0 0
+        """
+
+You can use the following contracts:
+
+.. module:: scrapy.contracts.default
+
+.. autoclass:: UrlContract
+
+.. autoclass:: CallbackKeywordArgumentsContract
+
+.. autoclass:: MetadataContract
+
+.. autoclass:: MethodContract
+
+.. autoclass:: BodyContract
+
+.. autoclass:: HeaderContract
+
+.. autoclass:: CookieContract
+
+.. autoclass:: ReturnsContract
+
+.. autoclass:: ScrapesContract
+
+Use the :command:`check` command to run the contract checks. It ignores
+:setting:`ITEM_PIPELINES` and :setting:`FEEDS`, since contracts check the
+output of callbacks instead of sending it to item processing; use the ``-s``
+command-line option to set them back for a check run.
+
+.. versionchanged:: 2.18.0
+   :setting:`ITEM_PIPELINES` and :setting:`FEEDS` are now ignored.
+
+Custom Contracts
+================
+
+If you find you need more power than the built-in Scrapy contracts, you can
+create and load your own contracts in the project by using the
+:setting:`SPIDER_CONTRACTS` setting:
+
+.. code-block:: python
+
+    SPIDER_CONTRACTS = {
+        "myproject.contracts.ResponseCheck": 10,
+        "myproject.contracts.ItemValidate": 10,
+    }
+
+Each contract must inherit from :class:`~scrapy.contracts.Contract` and can
+override three methods:
+
+.. autoclass:: scrapy.contracts.Contract
+
+    .. automethod:: adjust_request_args
+
+    .. method:: pre_process(response)
+
+        This allows hooking in various checks on the response received from the
+        sample request, before it is passed to the callback.
+
+    .. method:: post_process(output)
+
+        This allows processing the output of the callback. Iterators are
+        converted to lists before being passed to this hook.
+
+Raise :class:`~scrapy.exceptions.ContractFail` from
+:class:`~scrapy.contracts.Contract.pre_process` or
+:class:`~scrapy.contracts.Contract.post_process` if expectations are not met:
+
+.. autoclass:: scrapy.exceptions.ContractFail
+
+Here is a demo contract which checks the presence of a custom header in the
+response received:
+
+.. skip: next
+.. code-block:: python
+
+    from scrapy.contracts import Contract
+    from scrapy.exceptions import ContractFail
+
+
+    class HasHeaderContract(Contract):
+        """Demo contract that checks the presence of a custom header:
+        @has_header X-CustomHeader"""
+
+        name = "has_header"
+
+        def pre_process(self, response):
+            for header in self.args:
+                if header not in response.headers:
+                    raise ContractFail("X-CustomHeader not present")
+
+.. _detecting-contract-check-runs:
+
+Detecting check runs
+====================
+
+When ``scrapy check`` is running, the ``SCRAPY_CHECK`` environment variable is
+set to the ``true`` string. You can use :data:`os.environ` to make any changes
+to your spiders or your settings when ``scrapy check`` is used:
+
+.. code-block:: python
+
+    import os
+    import scrapy
+
+
+    class ExampleSpider(scrapy.Spider):
+        name = "example"
+
+        def __init__(self):
+            if os.environ.get("SCRAPY_CHECK"):
+                pass  # Do some scraper adjustments when a check is running

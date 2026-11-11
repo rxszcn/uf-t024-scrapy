@@ -1,0 +1,288 @@
+from __future__ import annotations
+
+import weakref
+
+import pytest
+
+from scrapy.http import HtmlResponse, JsonResponse, TextResponse, XmlResponse
+from scrapy.selector import Selector
+
+
+class TestSelector:
+    def test_simple_selection(self) -> None:
+        """Simple selector tests"""
+        body = b"<p><input name='a'value='1'/><input name='b'value='2'/></p>"
+        response = TextResponse(url="http://example.com", body=body, encoding="utf-8")
+        sel = Selector(response)
+
+        xl = sel.xpath("//input")
+        assert len(xl) == 2
+        for x in xl:
+            assert isinstance(x, Selector)
+
+        assert sel.xpath("//input").getall() == [x.get() for x in sel.xpath("//input")]
+        assert [x.get() for x in sel.xpath("//input[@name='a']/@name")] == ["a"]
+        assert [
+            x.get()
+            for x in sel.xpath(
+                "number(concat(//input[@name='a']/@value, //input[@name='b']/@value))"
+            )
+        ] == ["12.0"]
+        assert sel.xpath("concat('xpath', 'rules')").getall() == ["xpathrules"]
+        assert [
+            x.get()
+            for x in sel.xpath(
+                "concat(//input[@name='a']/@value, //input[@name='b']/@value)"
+            )
+        ] == ["12"]
+
+    def test_root_base_url(self) -> None:
+        body = b'<html><form action="/path"><input name="a" /></form></html>'
+        url = "http://example.com/"
+        response = TextResponse(url=url, body=body, encoding="utf-8")
+        sel = Selector(response)
+        assert url == sel.root.base
+
+    def test_flavor_detection(self) -> None:
+        text = b'<div><img src="a.jpg"><p>Hello</div>'
+        sel = Selector(XmlResponse("http://example.com", body=text, encoding="utf-8"))
+        assert sel.type == "xml"
+        assert sel.xpath("//div").getall() == [
+            '<div><img src="a.jpg"><p>Hello</p></img></div>'
+        ]
+
+        sel = Selector(HtmlResponse("http://example.com", body=text, encoding="utf-8"))
+        assert sel.type == "html"
+        assert sel.xpath("//div").getall() == [
+            '<div><img src="a.jpg"><p>Hello</p></div>'
+        ]
+
+    def test_flavor_detection_json(self) -> None:
+        response = JsonResponse(
+            "http://example.com", body=b'{"a": "b"}', encoding="utf-8"
+        )
+        assert Selector(response).type == "json"
+        assert response.jmespath("a").get() == "b"
+
+    def test_flavor_detection_json_with_html_body(self) -> None:
+        body = b"<div><p>Hello</p></div>"
+        response = JsonResponse("http://example.com", body=body, encoding="utf-8")
+        assert Selector(response).type == "json"
+
+        html_response = response.replace(cls=HtmlResponse)
+        assert Selector(html_response).type == "html"
+        assert html_response.css("p::text").get() == "Hello"
+
+    def test_flavor_detection_text(self) -> None:
+        response = TextResponse(
+            "http://example.com", body=b"<div><p>Hello</p></div>", encoding="utf-8"
+        )
+        assert Selector(response).type == "html"
+
+    def test_http_header_encoding_precedence(self) -> None:
+        # '\xa3'     = pound symbol in unicode
+        # '\xc2\xa3' = pound symbol in utf-8
+        # '\xa3'     = pound symbol in latin-1 (iso-8859-1)
+
+        meta = (
+            '<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">'
+        )
+        head = f"<head>{meta}</head>"
+        body_content = '<span id="blank">\xa3</span>'
+        body = f"<body>{body_content}</body>"
+        html = f"<html>{head}{body}</html>"
+        encoding = "utf-8"
+        html_utf8 = html.encode(encoding)
+
+        headers = {"Content-Type": ["text/html; charset=utf-8"]}
+        response = HtmlResponse(
+            url="http://example.com", headers=headers, body=html_utf8
+        )
+        x = Selector(response)
+        assert x.xpath("//span[@id='blank']/text()").getall() == ["\xa3"]
+
+    def test_badly_encoded_body(self) -> None:
+        # \xe9 alone isn't valid utf8 sequence
+        r1 = TextResponse(
+            "http://www.example.com",
+            body=b"<html><p>an Jos\xe9 de</p><html>",
+            encoding="utf-8",
+        )
+        Selector(r1).xpath("//text()").getall()
+
+    @pytest.mark.parametrize(
+        ("body", "headers"),
+        [
+            ("﻿<p>£€</p>".encode("utf-16-le"), {}),
+            (
+                "<p>£€</p>".encode("utf-16-le"),
+                {"Content-Type": "text/html; charset=utf-16-le"},
+            ),
+        ],
+    )
+    def test_utf16(self, body: bytes, headers: dict[str, str]) -> None:
+        response = HtmlResponse("https://example.com", body=body, headers=headers)
+        assert response.css("p::text").get() == "£€"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"<meta charset=euc-jp><p>\xa1\xc1 \xad\xa1</p>",
+            b"<p>\xa1\xc1 \xad\xa1" + "日本語です。".encode("euc_jp") * 50 + b"</p>",
+        ],
+    )
+    def test_browser_decoding(self, body: bytes) -> None:
+        response = HtmlResponse("https://example.com", body=body)
+        assert response.css("p::text").get("").startswith("～ ①")
+
+    def test_weakref_slots(self) -> None:
+        """Check that classes are using slots and are weak-referenceable"""
+        x = Selector(text="")
+        weakref.ref(x)
+        assert not hasattr(x, "__dict__"), (
+            f"{x.__class__.__name__} does not use __slots__"
+        )
+
+    def test_response(self) -> None:
+        response = TextResponse(url="http://example.com", body=b"")
+        assert Selector(response).response is response
+
+    def test_selector_bad_args(self) -> None:
+        with pytest.raises(ValueError, match="received both response and text"):
+            Selector(TextResponse(url="http://example.com", body=b""), text="")
+
+
+class TestJMESPath:
+    def test_json_has_html(self) -> None:
+        """Sometimes the information is returned in a json wrapper"""
+
+        body = """
+        {
+            "content": [
+                {
+                    "name": "A",
+                    "value": "a"
+                },
+                {
+                    "name": {
+                        "age": 18
+                    },
+                    "value": "b"
+                },
+                {
+                    "name": "C",
+                    "value": "c"
+                },
+                {
+                    "name": "<a>D</a>",
+                    "value": "<div>d</div>"
+                }
+            ],
+            "html": "<div><a>a<br>b</a>c</div><div><a>d</a>e<b>f</b></div>"
+        }
+        """
+        resp = TextResponse(url="http://example.com", body=body, encoding="utf-8")
+        assert (
+            resp.jmespath("html").get()
+            == "<div><a>a<br>b</a>c</div><div><a>d</a>e<b>f</b></div>"
+        )
+        assert resp.jmespath("html").xpath("//div/a/text()").getall() == ["a", "b", "d"]
+        assert resp.jmespath("html").css("div > b").getall() == ["<b>f</b>"]
+        assert resp.jmespath("content").jmespath("name.age").get() == 18  # type: ignore[comparison-overlap]
+
+    def test_html_has_json(self) -> None:
+        body = """
+        <div>
+            <h1>Information</h1>
+            <content>
+            {
+              "user": [
+                        {
+                                  "name": "A",
+                                  "age": 18
+                        },
+                        {
+                                  "name": "B",
+                                  "age": 32
+                        },
+                        {
+                                  "name": "C",
+                                  "age": 22
+                        },
+                        {
+                                  "name": "D",
+                                  "age": 25
+                        }
+              ],
+              "total": 4,
+              "status": "ok"
+            }
+            </content>
+        </div>
+        """
+        resp = TextResponse(url="http://example.com", body=body, encoding="utf-8")
+        assert resp.xpath("//div/content/text()").jmespath("user[*].name").getall() == [
+            "A",
+            "B",
+            "C",
+            "D",
+        ]
+        assert resp.xpath("//div/content").jmespath("user[*].name").getall() == [
+            "A",
+            "B",
+            "C",
+            "D",
+        ]
+        assert resp.xpath("//div/content").jmespath("total").get() == 4  # type: ignore[comparison-overlap]
+
+    def test_jmestpath_with_re(self) -> None:
+        body = """
+            <div>
+                <h1>Information</h1>
+                <content>
+                {
+                  "user": [
+                            {
+                                      "name": "A",
+                                      "age": 18
+                            },
+                            {
+                                      "name": "B",
+                                      "age": 32
+                            },
+                            {
+                                      "name": "C",
+                                      "age": 22
+                            },
+                            {
+                                      "name": "D",
+                                      "age": 25
+                            }
+                  ],
+                  "total": 4,
+                  "status": "ok"
+                }
+                </content>
+            </div>
+            """
+        resp = TextResponse(url="http://example.com", body=body, encoding="utf-8")
+        assert resp.xpath("//div/content/text()").jmespath("user[*].name").re(
+            r"(\w+)"
+        ) == ["A", "B", "C", "D"]
+        assert resp.xpath("//div/content").jmespath("user[*].name").re(r"(\w+)") == [
+            "A",
+            "B",
+            "C",
+            "D",
+        ]
+
+        assert resp.xpath("//div/content").jmespath("unavailable").re(r"(\d+)") == []
+
+        assert (
+            resp.xpath("//div/content").jmespath("unavailable").re_first(r"(\d+)")
+            is None
+        )
+
+        assert resp.xpath("//div/content").jmespath("user[*].age.to_string(@)").re(
+            r"(\d+)"
+        ) == ["18", "32", "22", "25"]

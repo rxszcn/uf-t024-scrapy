@@ -1,0 +1,326 @@
+from __future__ import annotations
+
+from pathlib import Path
+from time import process_time
+from urllib.parse import urlparse
+
+import pytest
+
+from scrapy.exceptions import ScrapyDeprecationWarning
+from scrapy.http import HtmlResponse, Response, TextResponse
+from scrapy.utils.response import (
+    get_base_url,
+    get_meta_refresh,
+    open_in_browser,
+    response_status_message,
+)
+
+
+def _read_browser_output(burl: str) -> bytes:
+    path = urlparse(burl).path
+    if not path or not Path(path).exists():
+        path = burl.replace("file://", "")
+    return Path(path).read_bytes()
+
+
+def test_open_in_browser():
+    url = "http://www.example.com/some/page.html"
+    body = (
+        b"<html> <head> <title>test page</title> </head> <body>test body</body> </html>"
+    )
+
+    def browser_open(burl: str) -> bool:
+        bbody = _read_browser_output(burl)
+        assert b'<base href="' + url.encode() + b'">' in bbody
+        return True
+
+    response = HtmlResponse(url, body=body)
+    assert open_in_browser(response, _openfunc=browser_open), "Browser not called"
+
+    resp = Response(url, body=body)
+    with pytest.raises(TypeError):
+        open_in_browser(resp, _openfunc=browser_open)
+
+
+def test_get_meta_refresh() -> None:
+    body = b'<noscript><meta http-equiv="refresh" content="5;url=/a"></noscript>'
+    response = HtmlResponse("http://www.example.com", body=body)
+    with pytest.warns(ScrapyDeprecationWarning, match="TextResponse.meta_refresh"):
+        assert get_meta_refresh(response) == (None, None)
+    with pytest.warns(ScrapyDeprecationWarning):
+        assert get_meta_refresh(response, ignore_tags=["script"]) == (
+            5.0,
+            "http://www.example.com/a",
+        )
+    with (
+        pytest.warns(ScrapyDeprecationWarning),
+        pytest.raises(ValueError, match="div"),
+    ):
+        get_meta_refresh(response, ignore_tags=["div"])
+
+
+def test_get_base_url() -> None:
+    response = HtmlResponse("http://www.example.com", body=b'<base href="/a/">')
+    with pytest.warns(ScrapyDeprecationWarning, match="TextResponse.base_url"):
+        assert get_base_url(response) == "http://www.example.com/a/"
+
+
+def test_response_status_message():
+    assert response_status_message(200) == "200 OK"
+    assert response_status_message(404) == "404 Not Found"
+    assert response_status_message(573) == "573 Unknown Status"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            b"""
+    <html>
+        <head><title>Dummy</title></head>
+        <body><p>Hello world.</p></body>
+    </html>""",
+            id="Simple",
+        ),
+        pytest.param(
+            b"""
+    <html>
+        <head id="foo"><title>Dummy</title></head>
+        <body>Hello world.</body>
+    </html>""",
+            id="<head> with attrs",
+        ),
+        pytest.param(
+            b"""
+    <html>
+        <head><title>Dummy</title></head>
+        <body>
+            <header>Hello header</header>
+            <p>Hello world.</p>
+        </body>
+    </html>""",
+            id="Misleading tag",
+        ),
+        pytest.param(
+            b"""
+    <html>
+        <!-- <head>Dummy comment</head> -->
+        <head><title>Dummy</title></head>
+        <body><p>Hello world.</p></body>
+    </html>""",
+            id="Misleading comment",
+        ),
+        pytest.param(
+            b"""
+    <html>
+        <!--[if IE]>
+        <head><title>IE head</title></head>
+        <![endif]-->
+        <!--[if !IE]>-->
+        <head><title>Standard head</title></head>
+        <!--<![endif]-->
+        <body><p>Hello world.</p></body>
+    </html>""",
+            id="Conditional comment",
+        ),
+        pytest.param(
+            b"""
+    <html>
+        <body><p>Hello world.</p></body>
+    </html>""",
+            id="No <head>",
+        ),
+        pytest.param(
+            b"<p>Hello world.</p>",
+            id="No <html>",
+        ),
+        pytest.param(
+            b"""<!DOCTYPE html>
+    <html>
+        <head><title>Dummy</title></head>
+        <body><p>Hello world.</p></body>
+    </html>""",
+            id="Doctype",
+        ),
+        pytest.param(
+            b"""
+    <!-- <head><base href="http://example.org"></head> -->
+    <p>Hello world.</p>""",
+            id="Only commented-out <head> and <base>",
+        ),
+    ],
+)
+def test_inject_base_url(body: bytes) -> None:
+    url = "http://www.example.com/"
+
+    def check_base_url(burl):
+        bbody = _read_browser_output(burl)
+        base_tag = b'<base href="' + url.encode() + b'">'
+        assert bbody.count(base_tag) == 1
+        index = bbody.index(base_tag)
+        # The base tag is not commented out.
+        assert bbody.rfind(b"<!--", 0, index) <= bbody.rfind(b"-->", 0, index)
+        # The base tag comes after the doctype declaration, if any.
+        assert b"<!DOCTYPE" not in bbody[index:]
+        return True
+
+    resp = HtmlResponse(url, body=body)
+    assert open_in_browser(resp, _openfunc=check_base_url)
+
+
+def _assert_open_in_browser_is_fast(body: bytes) -> None:
+    # The exploit inputs are large enough that a vulnerable implementation
+    # needs seconds to go through them, while a safe one stays in the low
+    # milliseconds even on a slow interpreter. The budget is set well above
+    # that low-milliseconds baseline to tolerate the syscall and cache/page-fault
+    # overhead that even a fast implementation picks up under CPU contention on
+    # busy CI runners, since process_time() counts that overhead even though it
+    # excludes time spent waiting for a CPU core.
+    max_cpu_time = 1
+
+    response = HtmlResponse("https://example.com", body=body)
+    start_time = process_time()
+    open_in_browser(response, lambda url: True)
+    end_time = process_time()
+    assert end_time - start_time < max_cpu_time
+
+
+def test_open_in_browser_redos_comment():
+    # Exploit input from
+    # https://makenowjust-labs.github.io/recheck/playground/
+    # for /<!--.*?-->/ (old pattern to remove comments). Unlike the linked
+    # exploit, this input has no "-->" anywhere, so a vulnerable
+    # implementation cannot short-circuit on an early match and degrades to
+    # quadratic behavior.
+    _assert_open_in_browser_is_fast(b"-><!--\x00" * 250_000)
+
+
+def test_open_in_browser_redos_head():
+    # Exploit input from
+    # https://makenowjust-labs.github.io/recheck/playground/
+    # for /(<head(?:>|\s.*?>))/ (old pattern to find the head element).
+    _assert_open_in_browser_is_fast(b"<head\t" * 80_000)
+
+
+def test_open_in_browser_preserves_html_comments():
+    url = "http://www.example.com/"
+    body = (
+        b"<html>"
+        b"<!-- preserved comment -->"
+        b"<head><title>Real</title></head>"
+        b"<body>content</body>"
+        b"</html>"
+    )
+
+    def check(burl):
+        bbody = _read_browser_output(burl)
+        assert b"<!-- preserved comment -->" in bbody
+        return True
+
+    response = HtmlResponse(url, body=body)
+    assert open_in_browser(response, _openfunc=check)
+
+
+@pytest.mark.parametrize(
+    ("base_tag", "expected_base_url"),
+    [
+        (b'<base href="http://real.com/">', b"http://real.com/"),
+        (b'<BASE HREF="http://real.com/">', b"http://real.com/"),
+        (b'<base href="/img/">', b"http://www.example.com/img/"),
+        (b'<base target="_blank">', b"http://www.example.com/page.html"),
+    ],
+)
+def test_open_in_browser_keeps_base_url_of_response(
+    base_tag: bytes, expected_base_url: bytes
+):
+    url = "http://www.example.com/page.html"
+    body = b"<html><head>" + base_tag + b"<title>T</title></head><body>hi</body></html>"
+
+    def check(burl):
+        bbody = _read_browser_output(burl)
+        assert bbody.startswith(b'<base href="' + expected_base_url + b'">')
+        return True
+
+    response = HtmlResponse(url, body=body)
+    assert open_in_browser(response, _openfunc=check)
+
+
+def test_open_in_browser_injects_base_when_only_in_comment():
+    url = "http://www.example.com/"
+    body = (
+        b"<html>"
+        b"<!-- <base href='http://other.com'> -->"
+        b"<head><title>Real</title></head>"
+        b"<body>content</body>"
+        b"</html>"
+    )
+
+    def check(burl):
+        bbody = _read_browser_output(burl)
+        assert b'<base href="' + url.encode() + b'">' in bbody
+        return True
+
+    response = HtmlResponse(url, body=body)
+    assert open_in_browser(response, _openfunc=check)
+
+
+def test_open_in_browser_injects_base_before_head_contents():
+    url = "http://www.example.com/"
+    body = (
+        b"<html>"
+        b"<!--<head>comment head</head>-->"
+        b"<head><title>Actual</title></head>"
+        b"<body>hello</body>"
+        b"</html>"
+    )
+
+    def check(burl):
+        bbody = _read_browser_output(burl)
+        assert bbody.count(b'<base href="' + url.encode() + b'">') == 1
+        base_pos = bbody.find(b'<base href="' + url.encode() + b'">')
+        title_pos = bbody.find(b"<title>Actual</title>")
+        assert base_pos < title_pos
+        return True
+
+    response = HtmlResponse(url, body=body)
+    assert open_in_browser(response, _openfunc=check)
+
+
+def test_open_in_browser_text_response_uses_txt_extension():
+    response = TextResponse("http://www.example.com", body=b"plain text content")
+
+    def check(burl):
+        assert burl.endswith(".txt")
+        return True
+
+    assert open_in_browser(response, _openfunc=check)
+
+
+def test_open_in_browser_raises_for_unsupported_response_type():
+    response = Response("http://www.example.com", body=b"binary")
+    with pytest.raises(TypeError):
+        open_in_browser(response, _openfunc=lambda _: True)
+
+
+def test_open_in_browser_uses_content_type_for_extension():
+    response = Response(
+        "http://www.example.com/file.pdf",
+        body=b"%PDF-1.4 fake pdf content",
+        headers={"Content-Type": "application/pdf"},
+    )
+
+    def check(burl):
+        assert burl.endswith(".pdf")
+        return True
+
+    assert open_in_browser(response, _openfunc=check)
+
+
+def test_open_in_browser_raises_for_unrecognized_content_type():
+    response = Response(
+        "http://www.example.com/file.bin",
+        body=b"binary",
+        headers={"Content-Type": "application/x-not-a-real-type"},
+    )
+    with pytest.raises(TypeError):
+        open_in_browser(response, _openfunc=lambda _: True)

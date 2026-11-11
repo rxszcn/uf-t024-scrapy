@@ -1,0 +1,207 @@
+import time
+from typing import Any
+
+import pytest
+
+from scrapy import Request
+from scrapy.core.downloader import Downloader, Slot
+from scrapy.exceptions import ScrapyDeprecationWarning
+from scrapy.utils.spider import DefaultSpider
+from scrapy.utils.test import get_crawler
+from tests.mockserver.http import MockServer
+from tests.spiders import MetaSpider
+from tests.utils.decorators import coroutine_test, inline_callbacks_test
+
+
+class DownloaderSlotsSettingsTestSpider(MetaSpider):
+    name = "downloader_slots"
+
+    custom_settings: dict[str, Any] = {
+        "DOWNLOAD_DELAY": 1,
+        "DOWNLOAD_DELAY_JITTER": 0,
+        "DOWNLOAD_SLOTS": {
+            "quotes.toscrape.com": {
+                "concurrency": 1,
+                "delay": 2,
+                "jitter": 0,
+                "throttle": False,
+            },
+            "books.toscrape.com": {"delay": 3, "jitter": 0},
+        },
+    }
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        assert self.mockserver
+        self.default_slot = self.mockserver.host
+        self.times: dict[str, list[float]] = {}
+
+    async def start(self):
+        assert self.mockserver
+        slots = [*self.custom_settings.get("DOWNLOAD_SLOTS", {}), None]
+        for slot in slots:
+            url = self.mockserver.url(f"/?downloader_slot={slot}")
+            self.times[slot or self.default_slot] = []
+            yield Request(url, callback=self.parse, meta={"download_slot": slot})
+
+    def parse(self, response):
+        assert self.mockserver
+        slot = response.meta.get("download_slot", self.default_slot)
+        self.times[slot].append(time.time())
+        url = self.mockserver.url(f"/?downloader_slot={slot}&req=2")
+        yield Request(url, callback=self.not_parse, meta={"download_slot": slot})
+
+    def not_parse(self, response):
+        slot = response.meta.get("download_slot", self.default_slot)
+        self.times[slot].append(time.time())
+
+
+class NoDelayDownloaderSlotsSpider(DownloaderSlotsSettingsTestSpider):
+    custom_settings = {
+        "DOWNLOAD_SLOTS": {
+            slot: {}
+            for slot in DownloaderSlotsSettingsTestSpider.custom_settings[
+                "DOWNLOAD_SLOTS"
+            ]
+        },
+    }
+
+
+@inline_callbacks_test
+def test_delay(mockserver: MockServer):
+    crawler = get_crawler(DownloaderSlotsSettingsTestSpider)
+    yield crawler.crawl(mockserver=mockserver)
+    assert isinstance(crawler.spider, DownloaderSlotsSettingsTestSpider)
+    slots = crawler.engine.downloader.slots
+    times = crawler.spider.times
+    # Downloading and processing a response add a roughly constant amount
+    # of time on top of the configured delay, so the margin is absolute.
+    # It stays well below the 1 second that separates the delays being
+    # compared, so a slot using the delay of another one still fails.
+    tolerance = 0.75
+
+    for slot, (first, second) in times.items():
+        assert abs((second - first) - slots[slot].delay) < tolerance
+
+
+@coroutine_test
+async def test_params():
+    params: dict[str, Any] = {
+        "concurrency": 1,
+        "delay": 2,
+        "jitter": 0,
+    }
+    settings = {
+        "DOWNLOAD_SLOTS": {
+            "example.com": params,
+        },
+    }
+    crawler = get_crawler(DefaultSpider, settings_dict=settings)
+    crawler.spider = crawler._create_spider()
+    downloader = Downloader(crawler)
+    request = Request("https://example.com")
+    _, actual = downloader._get_slot(request)
+    downloader.close()
+    await downloader.handlers._close()
+    expected = Slot(**params)
+    for param in params:
+        assert getattr(expected, param) == getattr(actual, param), (
+            f"Slot.{param}: {getattr(expected, param)!r} != {getattr(actual, param)!r}"
+        )
+
+
+@pytest.mark.parametrize(("value", "expected"), [(True, 0.5), (False, 0.0)])
+@coroutine_test
+async def test_deprecated_randomize_delay_param(value: bool, expected: float):
+    settings = {"DOWNLOAD_SLOTS": {"example.com": {"randomize_delay": value}}}
+    crawler = get_crawler(DefaultSpider, settings_dict=settings)
+    crawler.spider = crawler._create_spider()
+    downloader = Downloader(crawler)
+    with pytest.warns(
+        ScrapyDeprecationWarning,
+        match="The randomize_delay key of the DOWNLOAD_SLOTS setting is deprecated",
+    ):
+        _, slot = downloader._get_slot(Request("https://example.com"))
+    downloader.close()
+    await downloader.handlers._close()
+    assert slot.jitter == expected
+
+
+@coroutine_test
+async def test_get_slot_deprecated_spider_arg():
+    crawler = get_crawler(DefaultSpider)
+    crawler.spider = crawler._create_spider()
+    downloader = Downloader(crawler)
+    request = Request("https://example.com")
+
+    with pytest.warns(
+        ScrapyDeprecationWarning,
+        match=r"Passing a 'spider' argument to Downloader\._get_slot\(\) is deprecated",
+    ):
+        key1, slot1 = downloader._get_slot(request, spider=crawler.spider)
+    key2, slot2 = downloader._get_slot(request)
+    downloader.close()
+    await downloader.handlers._close()
+
+    assert key1 == key2
+    assert slot1 == slot2
+
+
+@pytest.mark.parametrize(
+    "priority_queue_class",
+    [
+        "scrapy.pqueues.ScrapyPriorityQueue",
+        "scrapy.pqueues.DownloaderAwarePriorityQueue",
+    ],
+)
+@coroutine_test
+async def test_none_slot_with_priority_queue(
+    mockserver: MockServer, priority_queue_class: str
+) -> None:
+    """Test specific cases for None slot handling with different priority queues."""
+    crawler = get_crawler(
+        NoDelayDownloaderSlotsSpider,
+        settings_dict={"SCHEDULER_PRIORITY_QUEUE": priority_queue_class},
+    )
+    await crawler.crawl_async(mockserver=mockserver)
+    assert isinstance(crawler.spider, NoDelayDownloaderSlotsSpider)
+
+    assert hasattr(crawler.spider, "times")
+    assert None not in crawler.spider.times
+    assert crawler.spider.default_slot in crawler.spider.times
+    assert len(crawler.spider.times[crawler.spider.default_slot]) == 2
+
+    stats = crawler.stats
+    assert stats.get_value("spider_exceptions", 0) == 0
+    assert stats.get_value("downloader/exception_count", 0) == 0
+
+
+class CrossDomainRedirectSpider(MetaSpider):
+    name = "cross_domain_redirect"
+
+    def __init__(self, *args: Any, slot: str | None = None, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.slot = slot
+
+    async def start(self):
+        assert self.mockserver
+        target = self.mockserver.url("/text").replace("127.0.0.1", "localhost")
+        url = self.mockserver.url(f"/redirect-to?goto={target}")
+        meta = {} if self.slot is None else {"download_slot": self.slot}
+        yield Request(url, meta=meta, callback=self.parse)
+
+    def parse(self, response):
+        self.meta["slot"] = response.meta["download_slot"]
+
+
+@pytest.mark.parametrize(
+    ("slot", "expected"), [(None, "localhost"), ("custom", "custom")]
+)
+@coroutine_test
+async def test_cross_domain_redirect(
+    mockserver: MockServer, slot: str | None, expected: str
+) -> None:
+    crawler = get_crawler(CrossDomainRedirectSpider)
+    await crawler.crawl_async(mockserver=mockserver, slot=slot)
+    assert isinstance(crawler.spider, CrossDomainRedirectSpider)
+    assert crawler.spider.meta["slot"] == expected

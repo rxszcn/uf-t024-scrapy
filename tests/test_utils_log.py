@@ -1,0 +1,576 @@
+from __future__ import annotations
+
+import json
+import logging
+import sys
+import warnings
+from io import StringIO
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+from twisted.python import log as twisted_log
+from twisted.python.failure import Failure
+
+from scrapy import LogRootFormatter
+from scrapy.exceptions import ScrapyDeprecationWarning
+from scrapy.settings import Settings
+from scrapy.utils.log import (
+    LogCounterHandler,
+    SpiderLoggerAdapter,
+    StreamLogger,
+    TopLevelFormatter,
+    _get_formatter,
+    _get_handler,
+    _uninstall_scrapy_root_handler,
+    configure_logging,
+    failure_to_exc_info,
+    get_scrapy_root_handler,
+    install_scrapy_root_handler,
+    logformatter_adapter,
+)
+from scrapy.utils.test import get_crawler
+from tests.spiders import LogSpider
+
+if TYPE_CHECKING:
+    from collections.abc import Generator, Mapping, MutableMapping
+    from pathlib import Path
+
+    from scrapy.crawler import Crawler
+    from scrapy.logformatter import LogFormatterResult
+
+
+class TestFailureToExcInfo:
+    def test_failure(self):
+        try:
+            0 / 0
+        except ZeroDivisionError:
+            exc_info = sys.exc_info()
+            failure = Failure()
+
+        assert exc_info == failure_to_exc_info(failure)
+
+    def test_non_failure(self):
+        assert failure_to_exc_info("test") is None  # type: ignore[arg-type]
+
+
+class TestTopLevelFormatter:
+    def test_top_level_logger(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.handler.addFilter(TopLevelFormatter(["test"]))
+        logger = logging.getLogger("test")
+        logger.warning("test log msg")
+        assert ("test", logging.WARNING, "test log msg") in caplog.record_tuples
+
+    def test_children_logger(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.handler.addFilter(TopLevelFormatter(["test"]))
+        logger = logging.getLogger("test.test1")
+        logger.warning("test log msg")
+        assert ("test", logging.WARNING, "test log msg") in caplog.record_tuples
+
+    def test_overlapping_name_logger(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.handler.addFilter(TopLevelFormatter(["test"]))
+        logger = logging.getLogger("test2")
+        logger.warning("test log msg")
+        assert ("test2", logging.WARNING, "test log msg") in caplog.record_tuples
+
+    def test_different_name_logger(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.handler.addFilter(TopLevelFormatter(["test"]))
+        logger = logging.getLogger("different")
+        logger.warning("test log msg")
+        assert ("different", logging.WARNING, "test log msg") in caplog.record_tuples
+
+
+class TestSpiderPlaceholderInLogFormat:
+    @staticmethod
+    def _log(log_format: str, extra: dict[str, Any] | None) -> str:
+        stream = StringIO()
+        settings = Settings({"LOG_FORMAT": log_format})
+        handler = _get_handler(settings)
+        assert isinstance(handler, logging.StreamHandler)
+        handler.stream = stream
+        logger = logging.getLogger("test_spider_placeholder")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            logger.info("test log msg", extra=extra)
+        finally:
+            logger.removeHandler(handler)
+        return stream.getvalue()
+
+    def test_default_placeholder(self) -> None:
+        assert self._log("%(spider)s %(message)s", None) == "- test log msg\n"
+
+    def test_spider_name(self) -> None:
+        spider = LogSpider()
+        assert self._log("%(spider)s %(message)s", {"spider": spider}) == (
+            "log_spider test log msg\n"
+        )
+
+
+class TestLogCounterHandler:
+    @pytest.fixture
+    def crawler(self) -> Crawler:
+        settings = {"LOG_LEVEL": "WARNING"}
+        return get_crawler(settings_dict=settings)
+
+    @pytest.fixture
+    def logger(self, crawler: Crawler) -> Generator[logging.Logger]:
+        logger = logging.getLogger("test")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        handler = LogCounterHandler(crawler, level=crawler.settings.get("LOG_LEVEL"))
+        logger.addHandler(handler)
+        try:
+            yield logger
+        finally:
+            logger.propagate = True
+            logger.setLevel(logging.NOTSET)
+            logger.removeHandler(handler)
+
+    def test_init(self, crawler: Crawler, logger: logging.Logger) -> None:
+        assert crawler.stats.get_value("log_count/DEBUG") is None
+        assert crawler.stats.get_value("log_count/INFO") is None
+        assert crawler.stats.get_value("log_count/WARNING") is None
+        assert crawler.stats.get_value("log_count/ERROR") is None
+        assert crawler.stats.get_value("log_count/CRITICAL") is None
+
+    def test_accepted_level(self, crawler: Crawler, logger: logging.Logger) -> None:
+        logger.error("test log msg")
+        assert crawler.stats.get_value("log_count/ERROR") == 1
+
+    def test_filtered_out_level(self, crawler: Crawler, logger: logging.Logger) -> None:
+        logger.debug("test log msg")
+        assert crawler.stats.get_value("log_count/DEBUG") is None
+
+
+class TestStreamLogger:
+    def test_redirect(self, caplog: pytest.LogCaptureFixture) -> None:
+        logger = logging.getLogger("test")
+        logger.setLevel(logging.WARNING)
+        old_stdout = sys.stdout
+        sys.stdout = StreamLogger(logger, logging.ERROR)
+
+        caplog.clear()
+        print("test log msg")
+        assert caplog.record_tuples == [("test", logging.ERROR, "test log msg")]
+
+        sys.stdout = old_stdout
+
+    def test_flush(self) -> None:
+        class FlushCountingHandler(logging.Handler):
+            flushes = 0
+
+            def flush(self) -> None:
+                self.flushes += 1
+
+        handler = FlushCountingHandler()
+        logger = logging.getLogger("test_flush")
+        logger.addHandler(handler)
+        try:
+            StreamLogger(logger).flush()
+        finally:
+            logger.removeHandler(handler)
+        assert handler.flushes == 1
+
+
+class _TTYStringIO(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class _UpperFormatter(logging.Formatter):
+    def __init__(self, settings: Settings):
+        super().__init__(settings["LOG_FORMAT"])
+
+    def format(self, record: logging.LogRecord) -> str:
+        return super().format(record).upper()
+
+
+class TestGetFormatter:
+    @staticmethod
+    def _settings(**overrides: Any) -> Settings:
+        values = {
+            "LOG_FORMAT": "%(levelname)s: %(message)s",
+            "LOG_DATEFORMAT": "%Y-%m-%d",
+            "LOG_COLOR": True,
+        }
+        values.update(overrides)
+        return Settings(values)
+
+    def test_colored_when_tty_and_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("colorlog")
+        monkeypatch.setattr("scrapy.utils.log.tty_supports_color", lambda: True)
+        stream = _TTYStringIO()
+        handler = logging.StreamHandler(stream)
+        settings = self._settings(LOG_ROOT_FORMATTER=_UpperFormatter)
+        handler.setFormatter(_get_formatter(handler, settings))
+        logger = logging.getLogger("test_get_formatter_colored")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            try:
+                raise ValueError("bar")
+            except ValueError:
+                logger.exception("boom")
+        finally:
+            logger.removeHandler(handler)
+        output = stream.getvalue()
+        assert "\x1b[" in output
+        assert "ERROR: BOOM" in output
+        assert output.count("VALUEERROR: BAR") == 1
+
+    def test_plain_when_not_a_tty(self) -> None:
+        handler = logging.StreamHandler(StringIO())
+        formatter = _get_formatter(handler, self._settings())
+        assert type(formatter) is LogRootFormatter
+
+    def test_custom_root_formatter(self) -> None:
+        handler = logging.StreamHandler(StringIO())
+        settings = self._settings(LOG_ROOT_FORMATTER=_UpperFormatter)
+        formatter = _get_formatter(handler, settings)
+        assert type(formatter) is _UpperFormatter
+
+    def test_plain_when_log_color_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("scrapy.utils.log.tty_supports_color", lambda: True)
+        handler = logging.StreamHandler(_TTYStringIO())
+        formatter = _get_formatter(handler, self._settings(LOG_COLOR=False))
+        assert type(formatter) is LogRootFormatter
+
+    def test_plain_for_file_handler(self, tmp_path: Path) -> None:
+        handler = logging.FileHandler(tmp_path / "log.txt")
+        try:
+            formatter = _get_formatter(handler, self._settings())
+        finally:
+            handler.close()
+        assert type(formatter) is LogRootFormatter
+
+    def test_plain_when_colorlog_not_installed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("scrapy.utils.log.tty_supports_color", lambda: True)
+        monkeypatch.setitem(sys.modules, "colorlog", None)
+        handler = logging.StreamHandler(_TTYStringIO())
+        formatter = _get_formatter(handler, self._settings())
+        assert type(formatter) is LogRootFormatter
+
+
+class TestConfigureLogging:
+    @pytest.fixture(autouse=True)
+    def restore_logging(self) -> Generator[None]:
+        root_handlers = logging.root.handlers[:]
+        # configure_logging() adds a Twisted log observer without giving any way
+        # to remove it afterwards.
+        observers = twisted_log.theLogPublisher.observers[:]
+        old_stdout = sys.stdout
+        old_showwarning = warnings.showwarning
+        try:
+            yield
+        finally:
+            warnings.showwarning = old_showwarning
+            sys.stdout = old_stdout
+            twisted_log.theLogPublisher.observers[:] = observers
+            logging.root.handlers[:] = root_handlers
+            _uninstall_scrapy_root_handler()
+
+    @staticmethod
+    def _warnings_are_captured() -> bool:
+        return warnings.showwarning.__module__ == "logging"
+
+    def test_log_stdout(self) -> None:
+        configure_logging(
+            settings={"LOG_STDOUT": True, "LOG_INSTALL_ROOT_HANDLER": False}
+        )
+        assert isinstance(sys.stdout, StreamLogger)
+
+    def test_captures_warnings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sys, "warnoptions", [])
+        logging.captureWarnings(False)
+        configure_logging(settings={"LOG_INSTALL_ROOT_HANDLER": False})
+        assert self._warnings_are_captured()
+
+    def test_keeps_warnoptions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sys, "warnoptions", ["default"])
+        logging.captureWarnings(False)
+        configure_logging(settings={"LOG_INSTALL_ROOT_HANDLER": False})
+        assert not self._warnings_are_captured()
+
+    def test_install_root_handler_param_deprecated(self) -> None:
+        with pytest.warns(ScrapyDeprecationWarning, match="install_root_handler"):
+            configure_logging(install_root_handler=False)
+
+    def test_reinstall_root_handler_removed_from_root(self) -> None:
+        install_scrapy_root_handler(Settings())
+        handler = get_scrapy_root_handler()
+        assert handler is not None
+        # Something else removed the handler from the root logger.
+        logging.root.removeHandler(handler)
+        install_scrapy_root_handler(Settings())
+        assert get_scrapy_root_handler() is not handler
+
+
+@pytest.mark.parametrize(
+    ("base_extra", "log_extra", "expected_extra"),
+    [
+        (
+            {"spider": "test"},
+            {"extra": {"log_extra": "info"}},
+            {"extra": {"log_extra": "info", "spider": "test"}},
+        ),
+        (
+            {"spider": "test"},
+            {"extra": None},
+            {"extra": {"spider": "test"}},
+        ),
+        (
+            {"spider": "test"},
+            {"extra": {"spider": "test2"}},
+            {"extra": {"spider": "test"}},
+        ),
+    ],
+)
+def test_spider_logger_adapter_process(
+    base_extra: Mapping[str, Any],
+    log_extra: MutableMapping[str, Any],
+    expected_extra: dict[str, Any],
+) -> None:
+    logger = logging.getLogger("test")
+    spider_logger_adapter = SpiderLoggerAdapter(logger, base_extra)
+
+    log_message = "test_log_message"
+    result_message, result_kwargs = spider_logger_adapter.process(
+        log_message, log_extra
+    )
+
+    assert result_message == log_message
+    assert result_kwargs == expected_extra
+
+
+class TestLogLevels:
+    @pytest.fixture(autouse=True)
+    def restore_levels(self) -> Generator[None]:
+        yield
+        for name in ("httpx", "boto3"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
+    def test_defaults(self) -> None:
+        configure_logging({"LOG_INSTALL_ROOT_HANDLER": False})
+
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("boto3").level == logging.NOTSET
+
+    def test_override(self) -> None:
+        configure_logging(
+            {
+                "LOG_LEVELS": {"httpx": "DEBUG", "boto3": "ERROR"},
+                "LOG_INSTALL_ROOT_HANDLER": False,
+            }
+        )
+
+        assert logging.getLogger("httpx").level == logging.DEBUG
+        assert logging.getLogger("boto3").level == logging.ERROR
+
+
+class TestLogging:
+    @pytest.fixture
+    def log_stream(self) -> StringIO:
+        return StringIO()
+
+    @pytest.fixture
+    def spider(self) -> LogSpider:
+        return LogSpider()
+
+    @pytest.fixture(autouse=True)
+    def logger(self, log_stream: StringIO) -> Generator[logging.Logger]:
+        handler = logging.StreamHandler(log_stream)
+        logger = logging.getLogger("log_spider")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+
+        try:
+            yield logger
+        finally:
+            logger.removeHandler(handler)
+
+    def test_debug_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Foo message"
+        spider.log_debug(log_message)
+        log_contents = log_stream.getvalue()
+
+        assert log_contents == f"{log_message}\n"
+
+    def test_info_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Bar message"
+        spider.log_info(log_message)
+        log_contents = log_stream.getvalue()
+
+        assert log_contents == f"{log_message}\n"
+
+    def test_warning_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Baz message"
+        spider.log_warning(log_message)
+        log_contents = log_stream.getvalue()
+
+        assert log_contents == f"{log_message}\n"
+
+    def test_error_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Foo bar message"
+        spider.log_error(log_message)
+        log_contents = log_stream.getvalue()
+
+        assert log_contents == f"{log_message}\n"
+
+    def test_critical_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Foo bar baz message"
+        spider.log_critical(log_message)
+        log_contents = log_stream.getvalue()
+
+        assert log_contents == f"{log_message}\n"
+
+
+class TestLoggingWithExtra:
+    @pytest.fixture
+    def log_stream(self) -> StringIO:
+        return StringIO()
+
+    @pytest.fixture
+    def spider(self) -> LogSpider:
+        return LogSpider()
+
+    @pytest.fixture(autouse=True)
+    def logger(self, log_stream: StringIO) -> Generator[logging.Logger]:
+        handler = logging.StreamHandler(log_stream)
+        formatter = logging.Formatter(
+            '{"levelname": "%(levelname)s", "message": "%(message)s", "spider": "%(spider)s", "important_info": "%(important_info)s"}'
+        )
+        handler.setFormatter(formatter)
+        logger = logging.getLogger("log_spider")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            yield logger
+        finally:
+            logger.removeHandler(handler)
+
+    def test_debug_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Foo message"
+        extra = {"important_info": "foo"}
+        spider.log_debug(log_message, extra)
+        log_contents_str = log_stream.getvalue()
+        log_contents = json.loads(log_contents_str)
+
+        assert log_contents["levelname"] == "DEBUG"
+        assert log_contents["message"] == log_message
+        assert log_contents["spider"] == "log_spider"
+        assert log_contents["important_info"] == extra["important_info"]
+
+    def test_info_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Bar message"
+        extra = {"important_info": "bar"}
+        spider.log_info(log_message, extra)
+        log_contents_str = log_stream.getvalue()
+        log_contents = json.loads(log_contents_str)
+
+        assert log_contents["levelname"] == "INFO"
+        assert log_contents["message"] == log_message
+        assert log_contents["spider"] == "log_spider"
+        assert log_contents["important_info"] == extra["important_info"]
+
+    def test_warning_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Baz message"
+        extra = {"important_info": "baz"}
+        spider.log_warning(log_message, extra)
+        log_contents_str = log_stream.getvalue()
+        log_contents = json.loads(log_contents_str)
+
+        assert log_contents["levelname"] == "WARNING"
+        assert log_contents["message"] == log_message
+        assert log_contents["spider"] == "log_spider"
+        assert log_contents["important_info"] == extra["important_info"]
+
+    def test_error_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Foo bar message"
+        extra = {"important_info": "foo bar"}
+        spider.log_error(log_message, extra)
+        log_contents_str = log_stream.getvalue()
+        log_contents = json.loads(log_contents_str)
+
+        assert log_contents["levelname"] == "ERROR"
+        assert log_contents["message"] == log_message
+        assert log_contents["spider"] == "log_spider"
+        assert log_contents["important_info"] == extra["important_info"]
+
+    def test_critical_logging(self, log_stream: StringIO, spider: LogSpider) -> None:
+        log_message = "Foo bar baz message"
+        extra = {"important_info": "foo bar baz"}
+        spider.log_critical(log_message, extra)
+        log_contents_str = log_stream.getvalue()
+        log_contents = json.loads(log_contents_str)
+
+        assert log_contents["levelname"] == "CRITICAL"
+        assert log_contents["message"] == log_message
+        assert log_contents["spider"] == "log_spider"
+        assert log_contents["important_info"] == extra["important_info"]
+
+    def test_overwrite_spider_extra(
+        self, log_stream: StringIO, spider: LogSpider
+    ) -> None:
+        log_message = "Foo message"
+        extra = {"important_info": "foo", "spider": "shouldn't change"}
+        spider.log_error(log_message, extra)
+        log_contents_str = log_stream.getvalue()
+        log_contents = json.loads(log_contents_str)
+
+        assert log_contents["levelname"] == "ERROR"
+        assert log_contents["message"] == log_message
+        assert log_contents["spider"] == "log_spider"
+        assert log_contents["important_info"] == extra["important_info"]
+
+
+class TestLogformatterAdapter:
+    @staticmethod
+    def _log(caplog: pytest.LogCaptureFixture, logkws: LogFormatterResult) -> str:
+        with caplog.at_level(logging.INFO):
+            logging.getLogger(__name__).log(*logformatter_adapter(logkws))
+        return caplog.records[-1].getMessage()
+
+    @pytest.mark.parametrize("args", [None, {}, ()])
+    def test_empty_args(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        args: dict[str, Any] | tuple[Any, ...] | None,
+    ) -> None:
+        logkws = cast(
+            "LogFormatterResult",
+            {"level": logging.INFO, "msg": "90% done", "args": args},
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ScrapyDeprecationWarning)
+            assert self._log(caplog, logkws) == "90% done"
+
+    @pytest.mark.parametrize(
+        ("msg", "args"),
+        [("%(pct)d%% done", {"pct": 90}), ("%d%% done", (90,))],
+    )
+    def test_args(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        msg: str,
+        args: dict[str, Any] | tuple[Any, ...],
+    ) -> None:
+        logkws: LogFormatterResult = {"level": logging.INFO, "msg": msg, "args": args}
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ScrapyDeprecationWarning)
+            assert self._log(caplog, logkws) == "90% done"
+
+    def test_msg_mapping_placeholders_without_args(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        logkws = cast(
+            "LogFormatterResult",
+            {"level": logging.INFO, "msg": "%(pct)d%% done", "pct": 90},
+        )
+        with pytest.warns(ScrapyDeprecationWarning, match="no args"):
+            assert self._log(caplog, logkws) == "90% done"

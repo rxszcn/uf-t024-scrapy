@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from tests.utils.bases.commands import TestProjectBase
+from tests.utils.cmdline import proc
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
+
+class TestCrawlCommand(TestProjectBase):
+    def crawl(
+        self, code: str, proj_path: Path, args: Iterable[str] = ()
+    ) -> tuple[int, str, str]:
+        (proj_path / self.project_name / "spiders" / "myspider.py").write_text(
+            code, encoding="utf-8"
+        )
+        return proc("crawl", "myspider", *args, cwd=proj_path)
+
+    def get_log(self, code: str, proj_path: Path, args: Iterable[str] = ()) -> str:
+        _, _, stderr = self.crawl(code, proj_path, args=args)
+        return stderr
+
+    def test_no_spider(self, proj_path: Path) -> None:
+        returncode, out, _ = proc("crawl", cwd=proj_path)
+        assert returncode == 2
+        assert "Usage" in out
+
+    def test_multiple_spiders(self, proj_path: Path) -> None:
+        returncode, _, err = proc("crawl", "myspider", "myspider2", cwd=proj_path)
+        assert returncode == 2
+        assert (
+            "running 'scrapy crawl' with more than one spider is not supported" in err
+        )
+
+    def test_no_output(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        self.logger.debug('It works!')
+        return
+        yield
+"""
+        returncode, _, log = self.crawl(spider_code, proj_path)
+        assert "[myspider] DEBUG: It works!" in log
+        assert (
+            "Using reactor: twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+            in log
+        )
+        assert "Spider closed (finished)" in log
+        assert returncode == 0
+
+    def test_output(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        self.logger.debug('FEEDS: {}'.format(self.settings.getdict('FEEDS')))
+        return
+        yield
+"""
+        args = ["-o", "example.json"]
+        log = self.get_log(spider_code, proj_path, args=args)
+        assert "[myspider] DEBUG: FEEDS: {'example.json': {'format': 'json'}}" in log
+
+    def test_overwrite_output(self, proj_path: Path) -> None:
+        spider_code = """
+import json
+import scrapy
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        self.logger.debug(
+            'FEEDS: {}'.format(
+                json.dumps(self.settings.getdict('FEEDS'), sort_keys=True)
+            )
+        )
+        return
+        yield
+"""
+        j = proj_path / "example.json"
+        j.write_text("not empty", encoding="utf-8")
+        args = ["-O", "example.json"]
+        log = self.get_log(spider_code, proj_path, args=args)
+        assert (
+            '[myspider] DEBUG: FEEDS: {"example.json": {"format": "json", "mode": "overwrite"}}'
+            in log
+        )
+        with j.open(encoding="utf-8") as f2:
+            first_line = f2.readline()
+        assert first_line != "not empty"
+
+    def test_output_and_overwrite_output(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        return
+        yield
+"""
+        args = ["-o", "example1.json", "-O", "example2.json"]
+        log = self.get_log(spider_code, proj_path, args=args)
+        assert (
+            "error: Please use only one of -o/--output and -O/--overwrite-output" in log
+        )
+
+    def test_errorcount_exit_code(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+    custom_settings = {'CLOSESPIDER_ERRORCOUNT': 1}
+
+    async def start(self):
+        raise Exception('Expected exception')
+        yield
+"""
+        returncode, _, err = self.crawl(spider_code, proj_path)
+        assert "Spider closed (closespider_errorcount)" in err
+        assert returncode != 0
+
+    def test_close_spider_error_exit_code(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+from scrapy.exceptions import CloseSpider
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        raise CloseSpider('payment_required', error=True)
+        yield
+"""
+        returncode, _, err = self.crawl(spider_code, proj_path)
+        assert "Spider closed (payment_required)" in err
+        assert returncode != 0
+
+    def test_close_spider_custom_reason_exit_code(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+from scrapy.exceptions import CloseSpider
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        raise CloseSpider('custom_reason')
+        yield
+"""
+        returncode, _, err = self.crawl(spider_code, proj_path)
+        assert "Spider closed (custom_reason)" in err
+        assert returncode == 0
+
+    def test_start_error_exit_code(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        raise Exception('Expected exception')
+        yield
+"""
+        returncode, _, err = self.crawl(spider_code, proj_path)
+        assert "Spider closed (start_error)" in err
+        assert returncode == 1
+
+    def test_default_reactor(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        self.logger.debug('It works!')
+        return
+        yield
+"""
+        log = self.get_log(spider_code, proj_path, args=("-s", "TWISTED_REACTOR="))
+        assert "[myspider] DEBUG: It works!" in log
+        assert (
+            "Using reactor: twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+            not in log
+        )
+        assert (
+            "Using a Twisted reactor other than twisted.internet.asyncioreactor.AsyncioSelectorReactor is deprecated"
+            in log
+        )
+        assert "Spider closed (finished)" in log
+
+    def test_no_reactor(self, proj_path: Path) -> None:
+        spider_code = """
+import scrapy
+
+class MySpider(scrapy.Spider):
+    name = 'myspider'
+
+    async def start(self):
+        self.logger.debug('It works!')
+        return
+        yield
+"""
+        log = self.get_log(
+            spider_code, proj_path, args=("-s", "TWISTED_REACTOR_ENABLED=False")
+        )
+        assert "[myspider] DEBUG: It works!" in log
+        assert "Not using a Twisted reactor" in log
+        assert "Spider closed (finished)" in log
