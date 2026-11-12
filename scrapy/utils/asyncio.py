@@ -134,16 +134,29 @@ async def _parallel_asyncio(
     Tasks are created on demand, one per item, so that a *count* much larger
     than the amount of work does not cost anything.
 
-    Exceptions raised by *callable_* are logged. If this coroutine is
-    cancelled, or iterating *iterable* raises an exception, the calls in
-    progress are cancelled; an exception from *iterable* is raised in an
-    :exc:`ExceptionGroup`.
+    Exceptions raised by *callable_* are logged. A :exc:`~asyncio.CancelledError`
+    raised by the processing of a single item, e.g. from a task cancelled inside
+    a pipeline, is logged like any other item error and does not cancel the
+    other calls in progress. If this coroutine itself is cancelled, the calls in
+    progress are cancelled; an exception raised while iterating *iterable* is
+    raised in an :exc:`ExceptionGroup`.
     """
     semaphore = asyncio.Semaphore(count)
 
     async def work(item: _T) -> None:
+        task = asyncio.current_task()
+        assert task is not None  # typing
         try:
             await callable_(item, *args, **kwargs)
+        except asyncio.CancelledError:
+            if task.cancelling():
+                # The task group is cancelling this call as part of a shutdown,
+                # propagate the cancellation instead of treating it as an error.
+                raise
+            # The cancellation originates in the item processing itself, not in
+            # the task group. The group would swallow it without logging it and
+            # the item would vanish silently, so record it as an item error.
+            logger.exception("Error processing an item")
         except Exception:
             logger.exception("Error processing an item")
         finally:

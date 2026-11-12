@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from scrapy import Request, Spider
+from scrapy import Request, Spider, signals
 from scrapy.core import scraper as scraper_module
 from scrapy.core.scraper import Scraper, _Slot
 from scrapy.exceptions import IgnoreRequest, ScrapyDeprecationWarning
@@ -180,3 +181,52 @@ def test_slot_deprecated() -> None:
 def test_missing_attribute() -> None:
     with pytest.raises(AttributeError):
         scraper_module.Foo
+
+
+@pytest.mark.only_asyncio
+@coroutine_test
+async def test_item_cancelled_error_does_not_stall_scraper(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A CancelledError raised while processing one item is treated as an item
+    error: it is logged, the other items keep being processed and the spider
+    closes normally instead of stalling with the request stuck in the slot."""
+
+    class CancellingPipeline:
+        async def process_item(self, item: Any) -> Any:
+            if item["id"] == 2:
+                # A subtask cancelled inside the pipeline, e.g. by a timeout,
+                # whose CancelledError is not swallowed on the spot.
+                task = asyncio.create_task(asyncio.Event().wait())
+                task.cancel()
+                await task
+            return item
+
+    class CancellingSpider(Spider):
+        name = "cancelling"
+
+        async def start(self) -> AsyncIterator[Any]:
+            yield Request("data:,")
+
+        def parse(self, response: Response) -> Iterable[Any]:
+            for i in range(5):
+                yield {"id": i}
+
+    scraped: list[Any] = []
+
+    def on_item_scraped(item: Any, **kwargs: Any) -> None:
+        scraped.append(item)
+
+    crawler = get_crawler(
+        CancellingSpider,
+        {"ITEM_PIPELINES": {CancellingPipeline: 1}},
+    )
+    crawler.signals.connect(on_item_scraped, signals.item_scraped)
+    # Without the fix the crawl never finishes, so this turns the hang into a
+    # test failure instead of blocking the whole suite.
+    async with asyncio.timeout(10):
+        await crawler.crawl_async()
+    assert sorted(item["id"] for item in scraped) == [0, 1, 3, 4]
+    assert crawler.stats.get_value("item_scraped_count") == 4
+    assert "Error processing an item" in caplog.text
+    assert "CancelledError" in caplog.text

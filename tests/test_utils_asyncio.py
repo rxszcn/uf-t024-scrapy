@@ -187,6 +187,54 @@ class TestParallelAsyncio:
         assert sorted(cancelled) == [0, 1, 2]
 
     @coroutine_test
+    async def test_cancelled_error_in_callable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A CancelledError raised by a single call is treated as an item error:
+        it is logged, the other calls keep running and the whole coroutine
+        completes instead of being cancelled."""
+        results: list[int] = []
+
+        async def callable_(o: int) -> None:
+            if o == 1:
+                # simulate a subtask cancelled inside the item processing,
+                # e.g. by asyncio.timeout() or an explicit task.cancel()
+                raise asyncio.CancelledError
+            results.append(o)
+
+        await _parallel_asyncio(range(4), 2, callable_)
+        assert sorted(results) == [0, 2, 3]
+        assert "Error processing an item" in caplog.text
+        assert "CancelledError" in caplog.text
+
+    @coroutine_test
+    async def test_cancelled_error_does_not_block_group_cancellation(self) -> None:
+        """A call that fails with CancelledError must not stop a later
+        cancellation of the coroutine from cancelling the calls in progress."""
+        started: list[int] = []
+        cancelled: list[int] = []
+        all_started = asyncio.Event()
+
+        async def callable_(o: int) -> None:
+            started.append(o)
+            if o == 0:
+                raise asyncio.CancelledError
+            if len(started) == 3:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(o)
+                raise
+
+        task = asyncio.create_task(_parallel_asyncio(range(3), 3, callable_))
+        await all_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert sorted(cancelled) == [1, 2]
+
+    @coroutine_test
     async def test_iteration_error(self) -> None:
         """An exception raised while iterating is propagated in an exception
         group, and the calls in progress are cancelled."""
